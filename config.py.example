@@ -1,0 +1,12 @@
+"""
+配置文件示例
+复制此文件为 config.py 并填入你的实际配置
+"""
+
+# Telegram Bot Token（从 @BotFather 获取）
+BOT_TOKEN = "你的机器人Token"
+
+# 管理员用户ID列表（多个ID用逗号分隔，不要有空格）
+# 获取你的用户ID：向 @userinfobot 发送消息
+ADMIN_USER_IDS = "你的用户ID1,你的用户ID2"
+
