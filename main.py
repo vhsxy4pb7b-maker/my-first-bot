@@ -103,6 +103,38 @@ def admin_required(func):
     return wrapped
 
 
+def authorized_required(func):
+    """检查用户是否有操作权限（管理员或员工）"""
+    @wraps(func)
+    async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        # 检查是否有消息对象
+        if not update.message and not update.callback_query:
+            return
+
+        # 获取用户ID
+        user_id = update.effective_user.id if update.effective_user else None
+
+        if not user_id:
+            return
+
+        # 检查是否是管理员
+        if user_id in ADMIN_IDS:
+            return await func(update, context, *args, **kwargs)
+
+        # 检查是否是授权员工
+        if db_operations.is_user_authorized(user_id):
+            return await func(update, context, *args, **kwargs)
+
+        error_msg = "⚠️ 您没有权限执行此操作"
+        if update.message:
+            await update.message.reply_text(error_msg)
+        elif update.callback_query:
+            await update.callback_query.answer(error_msg, show_alert=True)
+        return
+
+    return wrapped
+
+
 def private_chat_only(func):
     """检查是否在私聊中使用命令的装饰器"""
     @wraps(func)
@@ -165,6 +197,52 @@ def update_grouped_data(group_id, field, amount):
     db_operations.update_grouped_data(group_id, field, amount)
 
 
+async def add_employee(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """添加员工（授权用户）"""
+    if not context.args:
+        await update.message.reply_text("❌ 用法: /add_employee <用户ID>")
+        return
+
+    try:
+        user_id = int(context.args[0])
+        if db_operations.add_authorized_user(user_id):
+            await update.message.reply_text(f"✅ 已添加员工: {user_id}")
+        else:
+            await update.message.reply_text("⚠️ 添加失败或用户已存在")
+    except ValueError:
+        await update.message.reply_text("❌ 用户ID必须是数字")
+
+
+async def remove_employee(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """移除员工（授权用户）"""
+    if not context.args:
+        await update.message.reply_text("❌ 用法: /remove_employee <用户ID>")
+        return
+
+    try:
+        user_id = int(context.args[0])
+        if db_operations.remove_authorized_user(user_id):
+            await update.message.reply_text(f"✅ 已移除员工: {user_id}")
+        else:
+            await update.message.reply_text("⚠️ 移除失败或用户不存在")
+    except ValueError:
+        await update.message.reply_text("❌ 用户ID必须是数字")
+
+
+async def list_employees(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """列出所有员工"""
+    users = db_operations.get_authorized_users()
+    if not users:
+        await update.message.reply_text("📋 暂无授权员工")
+        return
+
+    message = "📋 授权员工列表:\n\n"
+    for uid in users:
+        message += f"👤 `{uid}`\n"
+
+    await update.message.reply_text(message, parse_mode='Markdown')
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """发送欢迎消息"""
     financial_data = db_operations.get_financial_data()
@@ -192,8 +270,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⚙️ 管理功能：\n"
         "/adjust <金额> [备注] - 调整流动资金\n"
         "/create_attribution <ID> - 创建归属ID\n"
-        "/list_attributions - 列出所有归属ID\n\n"
-        "⚠️ 所有操作都需要管理员权限".format(financial_data['liquid_funds'])
+        "/list_attributions - 列出所有归属ID\n"
+        "/add_employee <ID> - 添加员工\n"
+        "/remove_employee <ID> - 移除员工\n"
+        "/list_employees - 查看员工列表\n\n"
+        "⚠️ 部分操作需要管理员权限".format(financial_data['liquid_funds'])
     )
 
 
@@ -324,9 +405,16 @@ async def handle_amount_operation(update: Update, context: ContextTypes.DEFAULT_
 
     # 权限检查
     user_id = update.effective_user.id if update.effective_user else None
-    if not user_id or user_id not in ADMIN_IDS:
+    if not user_id:
+        return
+
+    # 检查是否是管理员或授权用户
+    is_admin = user_id in ADMIN_IDS
+    is_authorized = db_operations.is_user_authorized(user_id)
+
+    if not is_admin and not is_authorized:
         logger.debug(f"用户 {user_id} 无权限执行快捷操作")
-        return  # 非管理员不处理
+        return  # 无权限不处理
 
     chat_id = update.message.chat_id
     text = update.message.text.strip()
@@ -354,7 +442,7 @@ async def handle_amount_operation(update: Update, context: ContextTypes.DEFAULT_
         if amount_text.endswith('b'):
             # 本金减少 - 需要订单
             if not order:
-                message = "❌ Failed" if is_group_chat(
+                message = "❌ Failed: No active order in this group." if is_group_chat(
                     update) else "❌ 本群没有订单，无法进行本金减少操作"
                 await update.message.reply_text(message)
                 return
@@ -363,7 +451,7 @@ async def handle_amount_operation(update: Update, context: ContextTypes.DEFAULT_
         elif amount_text.endswith('c'):
             # 违约协商还款 - 需要订单
             if not order:
-                message = "❌ Failed" if is_group_chat(
+                message = "❌ Failed: No active order in this group." if is_group_chat(
                     update) else "❌ 本群没有订单，无法进行违约协商还款操作"
                 await update.message.reply_text(message)
                 return
@@ -391,16 +479,16 @@ async def handle_amount_operation(update: Update, context: ContextTypes.DEFAULT_
                             f"当前总利息: {financial_data['interest']:.2f}"
                         )
             except ValueError:
-                message = "❌ Failed" if is_group_chat(
+                message = "❌ Failed: Invalid amount format." if is_group_chat(
                     update) else "❌ 金额格式错误，请输入有效的数字"
                 await update.message.reply_text(message)
     except ValueError:
-        message = "❌ Failed" if is_group_chat(
+        message = "❌ Failed: Invalid format. Example: +1000, +1000b, +1000c" if is_group_chat(
             update) else "❌ 金额格式错误，请输入有效的数字\n示例：+1000 或 +1000b 或 +1000c"
         await update.message.reply_text(message)
     except Exception as e:
         logger.error(f"处理金额操作时出错: {e}", exc_info=True)
-        message = "❌ Failed" if is_group_chat(
+        message = "❌ Failed: An error occurred." if is_group_chat(
             update) else f"⚠️ 处理时发生错误: {str(e)}"
         await update.message.reply_text(message)
 
@@ -409,29 +497,28 @@ async def process_principal_reduction(update: Update, order: dict, amount: float
     """处理本金减少"""
     try:
         if order['state'] not in ('normal', 'overdue'):
-            message = "❌ Failed" if is_group_chat(
+            message = "❌ Failed: Order state not allowed." if is_group_chat(
                 update) else "❌ 当前订单状态不支持本金减少操作"
             await update.message.reply_text(message)
             return
 
         if amount <= 0:
-            message = "❌ Failed" if is_group_chat(update) else "❌ 金额必须大于0"
+            message = "❌ Failed: Amount must be positive." if is_group_chat(
+                update) else "❌ 金额必须大于0"
             await update.message.reply_text(message)
             return
 
         if amount > order['amount']:
-            message = "❌ Failed" if is_group_chat(update) else (
-                f"❌ 金额超过订单金额\n"
-                f"订单金额: {order['amount']:.2f}\n"
-                f"输入金额: {amount:.2f}"
-            )
+            message = (f"❌ Failed: Exceeds order amount ({order['amount']:.2f})" if is_group_chat(update)
+                       else f"❌ 金额超过订单金额\n订单金额: {order['amount']:.2f}\n输入金额: {amount:.2f}")
             await update.message.reply_text(message)
             return
 
         # 更新订单金额
         new_amount = order['amount'] - amount
         if not db_operations.update_order_amount(order['chat_id'], new_amount):
-            message = "❌ Failed" if is_group_chat(update) else "⚠️ 更新订单金额失败"
+            message = "❌ Failed: DB Error" if is_group_chat(
+                update) else "⚠️ 更新订单金额失败"
             await update.message.reply_text(message)
             return
 
@@ -448,7 +535,7 @@ async def process_principal_reduction(update: Update, order: dict, amount: float
 
         # 群组只回复成功，私聊显示详情
         if is_group_chat(update):
-            await update.message.reply_text("✅ Success")
+            await update.message.reply_text(f"✅ Principal Reduced: {amount:.2f}\nRemaining: {new_amount:.2f}")
         else:
             await update.message.reply_text(
                 f"✅ 本金减少成功！\n"
@@ -458,36 +545,37 @@ async def process_principal_reduction(update: Update, order: dict, amount: float
             )
     except Exception as e:
         logger.error(f"处理本金减少时出错: {e}", exc_info=True)
-        await update.message.reply_text("⚠️ 处理时发生错误，请稍后重试")
+        message = "❌ Error" if is_group_chat(update) else "⚠️ 处理时发生错误，请稍后重试"
+        await update.message.reply_text(message)
 
 
 async def process_breach_payment(update: Update, order: dict, amount: float):
     """处理违约协商还款"""
     try:
         if order['state'] != 'breach':
-            message = "❌ Failed" if is_group_chat(
+            message = "❌ Failed: Order must be in breach state." if is_group_chat(
                 update) else "❌ 只有违约状态的订单才能进行协商还款"
             await update.message.reply_text(message)
             return
 
         if amount <= 0:
-            message = "❌ Failed" if is_group_chat(update) else "❌ 金额必须大于0"
+            message = "❌ Failed: Amount must be positive." if is_group_chat(
+                update) else "❌ 金额必须大于0"
             await update.message.reply_text(message)
             return
 
         if amount > order['amount']:
-            message = "❌ Failed" if is_group_chat(update) else (
-                f"❌ 金额超过订单金额\n"
-                f"订单金额: {order['amount']:.2f}\n"
-                f"输入金额: {amount:.2f}"
-            )
+            message = (f"❌ Failed: Exceeds order amount ({order['amount']:.2f})" if is_group_chat(update)
+                       else f"❌ 金额超过订单金额\n订单金额: {order['amount']:.2f}\n输入金额: {amount:.2f}")
             await update.message.reply_text(message)
             return
 
         # 更新订单金额
         new_amount = order['amount'] - amount
         if not db_operations.update_order_amount(order['chat_id'], new_amount):
-            await update.message.reply_text("⚠️ 更新订单金额失败")
+            message = "❌ Failed: DB Error" if is_group_chat(
+                update) else "⚠️ 更新订单金额失败"
+            await update.message.reply_text(message)
             return
 
         group_id = order['group_id']
@@ -503,7 +591,7 @@ async def process_breach_payment(update: Update, order: dict, amount: float):
 
         # 群组只回复成功，私聊显示详情
         if is_group_chat(update):
-            await update.message.reply_text("✅ Success")
+            await update.message.reply_text(f"✅ Breach Payment: {amount:.2f}\nRemaining: {new_amount:.2f}")
         else:
             await update.message.reply_text(
                 f"✅ 违约协商还款成功！\n"
@@ -513,14 +601,17 @@ async def process_breach_payment(update: Update, order: dict, amount: float):
             )
     except Exception as e:
         logger.error(f"处理违约还款时出错: {e}", exc_info=True)
-        await update.message.reply_text("⚠️ 处理时发生错误，请稍后重试")
+        message = "❌ Error" if is_group_chat(update) else "⚠️ 处理时发生错误，请稍后重试"
+        await update.message.reply_text(message)
 
 
 async def process_interest(update: Update, order: dict, amount: float):
     """处理利息收入"""
     try:
         if amount <= 0:
-            await update.message.reply_text("❌ 金额必须大于0")
+            message = "❌ Failed: Amount must be positive." if is_group_chat(
+                update) else "❌ 金额必须大于0"
+            await update.message.reply_text(message)
             return
 
         # 更新财务数据
@@ -532,7 +623,7 @@ async def process_interest(update: Update, order: dict, amount: float):
 
         # 群组只回复成功，私聊显示详情
         if is_group_chat(update):
-            await update.message.reply_text("✅ Success")
+            await update.message.reply_text("✅ Interest Received")
         else:
             financial_data = db_operations.get_financial_data()
             await update.message.reply_text(
@@ -542,7 +633,8 @@ async def process_interest(update: Update, order: dict, amount: float):
             )
     except Exception as e:
         logger.error(f"处理利息收入时出错: {e}", exc_info=True)
-        await update.message.reply_text("⚠️ 处理时发生错误，请稍后重试")
+        message = "❌ Error" if is_group_chat(update) else "⚠️ 处理时发生错误，请稍后重试"
+        await update.message.reply_text(message)
 
 
 async def set_normal(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -552,24 +644,26 @@ async def set_normal(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         order = db_operations.get_order_by_chat_id(chat_id)
         if not order:
-            message = "❌ Failed" if is_group_chat(update) else "❌ 本群没有订单"
+            message = "❌ Failed: No active order." if is_group_chat(
+                update) else "❌ 本群没有订单"
             await update.message.reply_text(message)
             return
 
         if order['state'] != 'overdue':
-            message = "❌ Failed" if is_group_chat(
+            message = "❌ Failed: Order must be overdue." if is_group_chat(
                 update) else "❌ 只有逾期状态的订单才能转为正常状态"
             await update.message.reply_text(message)
             return
 
         if not db_operations.update_order_state(chat_id, 'normal'):
-            message = "❌ Failed" if is_group_chat(update) else "⚠️ 更新状态失败"
+            message = "❌ Failed: DB Error" if is_group_chat(
+                update) else "⚠️ 更新状态失败"
             await update.message.reply_text(message)
             return
 
         # 群组只回复成功，私聊显示详情
         if is_group_chat(update):
-            await update.message.reply_text("✅ Success")
+            await update.message.reply_text(f"✅ Status Updated: normal\nOrder ID: {order['order_id']}")
         else:
             await update.message.reply_text(
                 f"✅ 订单状态已更新为正常\n"
@@ -578,7 +672,8 @@ async def set_normal(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
     except Exception as e:
         logger.error(f"更新订单状态时出错: {e}", exc_info=True)
-        await update.message.reply_text("⚠️ 处理时发生错误，请稍后重试")
+        message = "❌ Error" if is_group_chat(update) else "⚠️ 处理时发生错误，请稍后重试"
+        await update.message.reply_text(message)
 
 
 async def set_overdue(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -588,24 +683,26 @@ async def set_overdue(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         order = db_operations.get_order_by_chat_id(chat_id)
         if not order:
-            message = "❌ Failed" if is_group_chat(update) else "❌ 本群没有订单"
+            message = "❌ Failed: No active order." if is_group_chat(
+                update) else "❌ 本群没有订单"
             await update.message.reply_text(message)
             return
 
         if order['state'] != 'normal':
-            message = "❌ Failed" if is_group_chat(
+            message = "❌ Failed: Order must be normal." if is_group_chat(
                 update) else "❌ 只有正常状态的订单才能转为逾期"
             await update.message.reply_text(message)
             return
 
         if not db_operations.update_order_state(chat_id, 'overdue'):
-            message = "❌ Failed" if is_group_chat(update) else "⚠️ 更新状态失败"
+            message = "❌ Failed: DB Error" if is_group_chat(
+                update) else "⚠️ 更新状态失败"
             await update.message.reply_text(message)
             return
 
         # 群组只回复成功，私聊显示详情
         if is_group_chat(update):
-            await update.message.reply_text("✅ Success")
+            await update.message.reply_text(f"✅ Status Updated: overdue\nOrder ID: {order['order_id']}")
         else:
             await update.message.reply_text(
                 f"✅ 订单状态已更新为逾期\n"
@@ -614,7 +711,8 @@ async def set_overdue(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
     except Exception as e:
         logger.error(f"更新订单状态时出错: {e}", exc_info=True)
-        await update.message.reply_text("⚠️ 处理时发生错误，请稍后重试")
+        message = "❌ Error" if is_group_chat(update) else "⚠️ 处理时发生错误，请稍后重试"
+        await update.message.reply_text(message)
 
 
 async def set_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -623,12 +721,13 @@ async def set_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     order = db_operations.get_order_by_chat_id(chat_id)
     if not order:
-        message = "❌ Failed" if is_group_chat(update) else "本群没有订单"
+        message = "❌ Failed: No active order." if is_group_chat(
+            update) else "本群没有订单"
         await update.message.reply_text(message)
         return
 
     if order['state'] not in ('normal', 'overdue'):
-        message = "❌ Failed" if is_group_chat(
+        message = "❌ Failed: State must be normal or overdue." if is_group_chat(
             update) else "只有正常或逾期状态的订单才能标记为完成"
         await update.message.reply_text(message)
         return
@@ -653,7 +752,7 @@ async def set_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 群组只回复成功，私聊显示详情
     if is_group_chat(update):
-        await update.message.reply_text("✅ Success")
+        await update.message.reply_text(f"✅ Order Completed\nAmount: {amount:.2f}")
     else:
         await update.message.reply_text(
             f"订单已完成！\n"
@@ -668,12 +767,14 @@ async def set_breach(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     order = db_operations.get_order_by_chat_id(chat_id)
     if not order:
-        message = "❌ Failed" if is_group_chat(update) else "本群没有订单"
+        message = "❌ Failed: No active order." if is_group_chat(
+            update) else "本群没有订单"
         await update.message.reply_text(message)
         return
 
     if order['state'] != 'overdue':
-        message = "❌ Failed" if is_group_chat(update) else "只有逾期状态的订单才能标记为违约"
+        message = "❌ Failed: Order must be overdue." if is_group_chat(
+            update) else "只有逾期状态的订单才能标记为违约"
         await update.message.reply_text(message)
         return
 
@@ -696,7 +797,7 @@ async def set_breach(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 群组只回复成功，私聊显示详情
     if is_group_chat(update):
-        await update.message.reply_text("✅ Success")
+        await update.message.reply_text(f"✅ Marked as Breach\nAmount: {amount:.2f}")
     else:
         await update.message.reply_text(
             f"订单已标记为违约！\n"
@@ -711,12 +812,14 @@ async def set_breach_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     order = db_operations.get_order_by_chat_id(chat_id)
     if not order:
-        message = "❌ Failed" if is_group_chat(update) else "本群没有订单"
+        message = "❌ Failed: No active order." if is_group_chat(
+            update) else "本群没有订单"
         await update.message.reply_text(message)
         return
 
     if order['state'] != 'breach':
-        message = "❌ Failed" if is_group_chat(update) else "只有违约状态的订单才能标记为违约完成"
+        message = "❌ Failed: Order must be in breach." if is_group_chat(
+            update) else "只有违约状态的订单才能标记为违约完成"
         await update.message.reply_text(message)
         return
 
@@ -732,7 +835,7 @@ async def set_breach_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 群组只回复成功，私聊显示详情
     if is_group_chat(update):
-        await update.message.reply_text("✅ Success")
+        await update.message.reply_text("✅ Breach Order Ended")
     else:
         await update.message.reply_text(
             f"违约订单已完成！\n"
@@ -793,23 +896,58 @@ async def show_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     # 添加键盘按钮用于查看分组报表
+    keyboard = []
+
+    # 功能按钮行
+    keyboard.append([
+        InlineKeyboardButton("🔍 查找 & 锁定", callback_data="search_lock_start"),
+        InlineKeyboardButton("📢 群发通知", callback_data="broadcast_start")
+    ])
+
     if not context.args:  # 如果是全局报表，才显示分组按钮
-        keyboard = []
         group_ids = db_operations.get_all_group_ids()
         for group_id in sorted(group_ids):
             keyboard.append([InlineKeyboardButton(
                 f"查看 {group_id} 报表", callback_data=f"report_{group_id}")])
 
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text(report, reply_markup=reply_markup)
-    else:
-        await update.message.reply_text(report)
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(report, reply_markup=reply_markup)
 
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """处理按钮回调"""
     query = update.callback_query
     await query.answer()
+
+    if query.data == "search_lock_start":
+        await query.message.reply_text(
+            "🔍 请输入查找条件（支持混合条件）：\n"
+            "格式：条件1=值1 条件2=值2\n"
+            "支持的条件：\n"
+            "- group_id: 归属ID\n"
+            "- state: 状态 (normal/overdue/breach/end/breach_end)\n"
+            "- customer: 客户类型 (A/B)\n"
+            "- order_id: 订单ID\n\n"
+            "示例：`group_id=S01 state=normal`\n"
+            "请输入：",
+            parse_mode='Markdown'
+        )
+        context.user_data['state'] = 'SEARCHING'
+        return
+
+    if query.data == "broadcast_start":
+        locked_groups = context.user_data.get('locked_groups', [])
+        if not locked_groups:
+            await query.message.reply_text("⚠️ 当前没有锁定的群组，请先使用查找功能锁定群组。")
+            return
+
+        await query.message.reply_text(
+            f"📢 准备向 {len(locked_groups)} 个群组发送通知。\n"
+            "请输入要发送的消息内容：\n"
+            "(输入 'cancel' 取消)"
+        )
+        context.user_data['state'] = 'BROADCASTING'
+        return
 
     if query.data.startswith("report_"):
         from datetime import datetime
@@ -959,8 +1097,103 @@ async def list_attributions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(message)
 
 
+async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """处理文本输入（用于搜索和群发）"""
+    user_state = context.user_data.get('state')
+
+    # 如果没有状态，或者不是在私聊中，或者是快捷操作，交给其他处理器
+    if not user_state or update.effective_chat.type != 'private' or update.message.text.startswith('+'):
+        return
+
+    text = update.message.text.strip()
+
+    if text.lower() == 'cancel':
+        context.user_data['state'] = None
+        await update.message.reply_text("✅ 操作已取消")
+        return
+
+    if user_state == 'SEARCHING':
+        # 解析搜索条件
+        criteria = {}
+        try:
+            # 支持 key=value 格式，也支持简单的单个值（为了兼容性，虽然提示是key=value）
+            if '=' in text:
+                parts = text.split()
+                for part in parts:
+                    if '=' in part:
+                        key, value = part.split('=', 1)
+                        key = key.strip().lower()
+                        value = value.strip()
+                        if key in ['group_id', 'state', 'customer', 'order_id']:
+                            criteria[key] = value
+            else:
+                # 尝试智能识别
+                # 如果是S开头加数字 -> group_id
+                # 如果是A或B -> customer
+                # 如果是状态词 -> state
+                # 否则 -> order_id
+                pass  # 暂时只支持 key=value 或依赖 /search 命令的解析逻辑
+                # 为了简单起见，这里要求用户使用 key=value 或者复用 search_orders 的逻辑
+                # 这里我们简单实现 key=value 解析，如果用户输入不带=，则提示错误
+                if not criteria:
+                    await update.message.reply_text("❌ 格式错误。请使用 `key=value` 格式，例如 `state=normal`", parse_mode='Markdown')
+                    return
+
+            orders = db_operations.search_orders_advanced(criteria)
+
+            if not orders:
+                await update.message.reply_text("❌ 未找到匹配的订单")
+                context.user_data['state'] = None
+                return
+
+            # 锁定群组
+            locked_groups = list(set(order['chat_id'] for order in orders))
+            context.user_data['locked_groups'] = locked_groups
+
+            await update.message.reply_text(
+                f"✅ 找到 {len(orders)} 个订单，涉及 {len(locked_groups)} 个群组。\n"
+                f"已锁定这些群组，您现在可以使用【群发通知】功能发送消息。\n"
+                f"输入 'cancel' 退出锁定状态（但保留锁定列表）。"
+            )
+            # 退出输入状态，但保留 locked_groups
+            context.user_data['state'] = None
+
+        except Exception as e:
+            logger.error(f"搜索出错: {e}")
+            await update.message.reply_text(f"⚠️ 搜索出错: {e}")
+            context.user_data['state'] = None
+
+    elif user_state == 'BROADCASTING':
+        locked_groups = context.user_data.get('locked_groups', [])
+        if not locked_groups:
+            await update.message.reply_text("⚠️ 锁定列表为空")
+            context.user_data['state'] = None
+            return
+
+        success_count = 0
+        fail_count = 0
+
+        await update.message.reply_text(f"⏳ 正在发送消息到 {len(locked_groups)} 个群组...")
+
+        for chat_id in locked_groups:
+            try:
+                await context.bot.send_message(chat_id=chat_id, text=text)
+                success_count += 1
+            except Exception as e:
+                logger.error(f"群发失败 {chat_id}: {e}")
+                fail_count += 1
+
+        await update.message.reply_text(
+            f"✅ 群发完成\n"
+            f"成功: {success_count}\n"
+            f"失败: {fail_count}"
+        )
+        context.user_data['state'] = None
+
+
 async def search_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """查找订单"""
+    """查找订单（兼容旧命令方式）"""
+    # ... existing code ...
     if not context.args or len(context.args) < 2:
         await update.message.reply_text(
             "用法: /search <类型> <值> [值2]\n"
@@ -982,48 +1215,49 @@ async def search_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     search_type = context.args[0].lower()
     orders = []
 
+    # 构建 criteria 字典
+    criteria = {}
+
     try:
         if search_type == 'order_id':
             if len(context.args) < 2:
                 await update.message.reply_text("请提供订单ID")
                 return
-            order = db_operations.get_order_by_order_id(context.args[1])
-            if order:
-                orders = [order]
+            criteria['order_id'] = context.args[1]
         elif search_type == 'group_id':
             if len(context.args) < 2:
                 await update.message.reply_text("请提供归属ID")
                 return
-            orders = db_operations.search_orders_by_group_id(context.args[1])
+            criteria['group_id'] = context.args[1]
         elif search_type == 'customer':
             if len(context.args) < 2:
                 await update.message.reply_text("请提供客户类型 (A 或 B)")
                 return
-            customer = context.args[1].upper()
-            if customer not in ('A', 'B'):
-                await update.message.reply_text("客户类型必须是 A 或 B")
-                return
-            orders = db_operations.search_orders_by_customer(customer)
+            criteria['customer'] = context.args[1].upper()
         elif search_type == 'state':
             if len(context.args) < 2:
                 await update.message.reply_text("请提供状态")
                 return
-            orders = db_operations.search_orders_by_state(context.args[1])
+            criteria['state'] = context.args[1]
         elif search_type == 'date':
             if len(context.args) < 3:
                 await update.message.reply_text("请提供开始日期和结束日期 (格式: YYYY-MM-DD)")
                 return
-            start_date = context.args[1]
-            end_date = context.args[2]
-            orders = db_operations.search_orders_by_date_range(
-                start_date, end_date)
+            criteria['date_range'] = (context.args[1], context.args[2])
         else:
             await update.message.reply_text(f"未知的搜索类型: {search_type}")
             return
 
+        orders = db_operations.search_orders_advanced(criteria)
+
         if not orders:
             await update.message.reply_text("❌ 未找到匹配的订单")
             return
+
+        # 锁定群组（命令搜索也触发锁定）
+        locked_groups = list(set(order['chat_id'] for order in orders))
+        context.user_data['locked_groups'] = locked_groups
+        await update.message.reply_text(f"ℹ️ 已锁定 {len(locked_groups)} 个群组，可使用群发功能。")
 
         # 格式化输出：只显示群组定位信息
         if len(orders) == 1:
@@ -1132,28 +1366,29 @@ def main() -> None:
 
     # 添加命令处理器（按新需求修改）
     application.add_handler(CommandHandler(
-        "start", private_chat_only(admin_required(start))))
+        "start", private_chat_only(authorized_required(start))))
     application.add_handler(CommandHandler(
-        "report", private_chat_only(admin_required(show_report))))
+        "report", private_chat_only(authorized_required(show_report))))
     application.add_handler(CommandHandler(
-        "search", private_chat_only(admin_required(search_orders))))
+        "search", private_chat_only(authorized_required(search_orders))))
 
-    # 其他需要管理员权限的命令
+    # 订单操作命令（员工可用）
     application.add_handler(CommandHandler(
-        "create", admin_required(create_order)))
+        "create", authorized_required(create_order)))
     application.add_handler(CommandHandler(
-        "normal", admin_required(set_normal)))
+        "normal", authorized_required(set_normal)))
     application.add_handler(CommandHandler(
-        "overdue", admin_required(set_overdue)))
-    application.add_handler(CommandHandler("end", admin_required(set_end)))
+        "overdue", authorized_required(set_overdue)))
     application.add_handler(CommandHandler(
-        "breach", admin_required(set_breach)))
+        "end", authorized_required(set_end)))
     application.add_handler(CommandHandler(
-        "breach_end", admin_required(set_breach_end)))
+        "breach", authorized_required(set_breach)))
     application.add_handler(CommandHandler(
-        "order", admin_required(show_current_order)))
+        "breach_end", authorized_required(set_breach_end)))
+    application.add_handler(CommandHandler(
+        "order", authorized_required(show_current_order)))
 
-    # 资金和归属ID管理
+    # 资金和归属ID管理（仅管理员）
     application.add_handler(CommandHandler(
         "adjust", private_chat_only(admin_required(adjust_funds))))
     application.add_handler(CommandHandler(
@@ -1161,16 +1396,30 @@ def main() -> None:
     application.add_handler(CommandHandler(
         "list_attributions", private_chat_only(admin_required(list_attributions))))
 
-    # 添加消息处理器（金额操作）- 需要管理员权限
+    # 员工管理（仅管理员）
+    application.add_handler(CommandHandler(
+        "add_employee", private_chat_only(admin_required(add_employee))))
+    application.add_handler(CommandHandler(
+        "remove_employee", private_chat_only(admin_required(remove_employee))))
+    application.add_handler(CommandHandler(
+        "list_employees", private_chat_only(admin_required(list_employees))))
+
+    # 添加消息处理器（金额操作）- 需要管理员或员工权限
     # 只处理以 + 开头的消息（快捷操作）
     application.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.Regex(r'^\+'),
         handle_amount_operation),
         group=1)  # 设置优先级组
 
+    # 添加通用文本处理器（用于处理搜索和群发输入）
+    application.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & ~filters.Regex(r'^\+'),
+        handle_text_input),
+        group=2)
+
     # 添加回调查询处理器
     application.add_handler(CallbackQueryHandler(
-        admin_required(button_callback)))
+        authorized_required(button_callback)))
 
     # 启动机器人
     try:
