@@ -76,19 +76,6 @@ def init_database():
     )
     ''')
 
-    # 创建订单计数器表
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS order_counter (
-        id INTEGER PRIMARY KEY,
-        counter INTEGER DEFAULT 0
-    )
-    ''')
-
-    # 初始化计数器（如果不存在）
-    cursor.execute('SELECT COUNT(*) FROM order_counter')
-    if cursor.fetchone()[0] == 0:
-        cursor.execute('INSERT INTO order_counter (id, counter) VALUES (1, 0)')
-
     # 创建日结数据表（按日期和归属ID存储）
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS daily_data (
@@ -106,8 +93,23 @@ def init_database():
         breach_amount REAL DEFAULT 0,
         breach_end_orders INTEGER DEFAULT 0,
         breach_end_amount REAL DEFAULT 0,
+        liquid_flow REAL DEFAULT 0,
+        company_expenses REAL DEFAULT 0,
+        other_expenses REAL DEFAULT 0,
         updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
         UNIQUE(date, group_id)
+    )
+    ''')
+
+    # 创建开销记录表
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS expense_records (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        date TEXT NOT NULL,
+        type TEXT NOT NULL,
+        amount REAL NOT NULL,
+        note TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
     )
     ''')
 
@@ -124,6 +126,14 @@ def init_database():
             breach_end_orders, breach_end_amount
         ) VALUES (0, 0, 100000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
         ''')
+
+    # 创建授权用户表（员工）
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS authorized_users (
+        user_id INTEGER PRIMARY KEY,
+        added_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )
+    ''')
 
     conn.commit()
     conn.close()

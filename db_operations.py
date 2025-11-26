@@ -1,7 +1,8 @@
 import sqlite3
 import os
 from datetime import datetime
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List, Tuple, Any
+from functools import wraps
 
 # 数据库文件路径 - 支持持久化存储
 # 如果设置了 DATA_DIR 环境变量，使用该目录；否则使用当前目录
@@ -18,12 +19,48 @@ def get_connection():
     return conn
 
 
+def db_transaction(func):
+    """数据库事务装饰器: 自动处理连接开启、提交、回滚和关闭"""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            # 将 cursor 注入到 kwargs 中，如果函数签名接受 'cursor'
+            # 或者直接作为第一个参数传递？
+            # 为了兼容现有代码，我们可能需要重构现有函数以接受 cursor
+            # 但那样改动太大。
+            # 另一种方式：装饰器管理 conn，将其传给函数，函数内部使用
+            return func(conn, cursor, *args, **kwargs)
+        except Exception as e:
+            conn.rollback()
+            print(f"Database error in {func.__name__}: {e}")
+            # 根据需要决定是否抛出异常或返回 False/None
+            # 现有代码多返回 False，我们保持这个行为
+            return False
+        finally:
+            conn.close()
+    return wrapper
+
+
+def db_query(func):
+    """数据库查询装饰器: 自动处理连接开启和关闭"""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            return func(conn, cursor, *args, **kwargs)
+        finally:
+            conn.close()
+    return wrapper
+
 # ========== 订单操作 ==========
 
-def create_order(order_data: Dict) -> bool:
+
+@db_transaction
+def create_order(conn, cursor, order_data: Dict) -> bool:
     """创建新订单"""
-    conn = get_connection()
-    cursor = conn.cursor()
     try:
         cursor.execute('''
         INSERT INTO orders (
@@ -45,184 +82,235 @@ def create_order(order_data: Dict) -> bool:
     except sqlite3.IntegrityError as e:
         print(f"订单创建失败（重复）: {e}")
         return False
-    except Exception as e:
-        print(f"订单创建失败: {e}")
-        conn.rollback()
-        return False
-    finally:
-        conn.close()
 
 
-def get_order_by_chat_id(chat_id: int) -> Optional[Dict]:
+@db_query
+def get_order_by_chat_id(conn, cursor, chat_id: int) -> Optional[Dict]:
     """根据chat_id获取订单"""
-    conn = get_connection()
-    cursor = conn.cursor()
-    try:
-        cursor.execute('SELECT * FROM orders WHERE chat_id = ? AND state NOT IN (?, ?)',
-                       (chat_id, 'end', 'breach_end'))
-        row = cursor.fetchone()
-        if row:
-            return dict(row)
-        return None
-    finally:
-        conn.close()
+    cursor.execute('SELECT * FROM orders WHERE chat_id = ? AND state NOT IN (?, ?)',
+                   (chat_id, 'end', 'breach_end'))
+    row = cursor.fetchone()
+    return dict(row) if row else None
 
 
-def get_order_by_order_id(order_id: str) -> Optional[Dict]:
+@db_query
+def get_order_by_order_id(conn, cursor, order_id: str) -> Optional[Dict]:
     """根据order_id获取订单"""
-    conn = get_connection()
-    cursor = conn.cursor()
-    try:
-        cursor.execute('SELECT * FROM orders WHERE order_id = ?', (order_id,))
-        row = cursor.fetchone()
-        if row:
-            return dict(row)
-        return None
-    finally:
-        conn.close()
+    cursor.execute('SELECT * FROM orders WHERE order_id = ?', (order_id,))
+    row = cursor.fetchone()
+    return dict(row) if row else None
 
 
-def update_order_amount(chat_id: int, new_amount: float) -> bool:
+@db_transaction
+def update_order_amount(conn, cursor, chat_id: int, new_amount: float) -> bool:
     """更新订单金额"""
-    conn = get_connection()
-    cursor = conn.cursor()
-    try:
-        cursor.execute('''
-        UPDATE orders 
-        SET amount = ?, updated_at = CURRENT_TIMESTAMP
-        WHERE chat_id = ? AND state NOT IN (?, ?)
-        ''', (new_amount, chat_id, 'end', 'breach_end'))
-        conn.commit()
-        return cursor.rowcount > 0
-    finally:
-        conn.close()
+    cursor.execute('''
+    UPDATE orders 
+    SET amount = ?, updated_at = CURRENT_TIMESTAMP
+    WHERE chat_id = ? AND state NOT IN (?, ?)
+    ''', (new_amount, chat_id, 'end', 'breach_end'))
+    conn.commit()
+    return cursor.rowcount > 0
 
 
-def update_order_state(chat_id: int, new_state: str) -> bool:
+@db_transaction
+def update_order_state(conn, cursor, chat_id: int, new_state: str) -> bool:
     """更新订单状态"""
-    conn = get_connection()
-    cursor = conn.cursor()
-    try:
-        cursor.execute('''
-        UPDATE orders 
-        SET state = ?, updated_at = CURRENT_TIMESTAMP
-        WHERE chat_id = ? AND state NOT IN (?, ?)
-        ''', (new_state, chat_id, 'end', 'breach_end'))
-        conn.commit()
-        return cursor.rowcount > 0
-    finally:
-        conn.close()
+    cursor.execute('''
+    UPDATE orders 
+    SET state = ?, updated_at = CURRENT_TIMESTAMP
+    WHERE chat_id = ? AND state NOT IN (?, ?)
+    ''', (new_state, chat_id, 'end', 'breach_end'))
+    conn.commit()
+    return cursor.rowcount > 0
 
 
 def delete_order_by_chat_id(chat_id: int) -> bool:
     """删除订单（标记为完成或违约完成时使用）"""
-    # 实际上不删除，只是状态已变为end或breach_end
     return True
-
 
 # ========== 查找功能 ==========
 
-def search_orders_by_group_id(group_id: str, state: Optional[str] = None) -> List[Dict]:
+
+@db_query
+def search_orders_by_group_id(conn, cursor, group_id: str, state: Optional[str] = None) -> List[Dict]:
     """根据归属ID查找订单"""
-    conn = get_connection()
-    cursor = conn.cursor()
-    try:
-        if state:
-            cursor.execute('SELECT * FROM orders WHERE group_id = ? AND state = ? ORDER BY date DESC',
-                           (group_id, state))
-        else:
-            cursor.execute(
-                'SELECT * FROM orders WHERE group_id = ? ORDER BY date DESC', (group_id,))
-        rows = cursor.fetchall()
-        return [dict(row) for row in rows]
-    finally:
-        conn.close()
+    if state:
+        cursor.execute('SELECT * FROM orders WHERE group_id = ? AND state = ? ORDER BY date DESC',
+                       (group_id, state))
+    else:
+        # 默认排除完成和违约完成的订单
+        cursor.execute(
+            "SELECT * FROM orders WHERE group_id = ? AND state NOT IN ('end', 'breach_end') ORDER BY date DESC", (group_id,))
+    rows = cursor.fetchall()
+    return [dict(row) for row in rows]
 
 
-def search_orders_by_date_range(start_date: str, end_date: str) -> List[Dict]:
+@db_query
+def search_orders_by_date_range(conn, cursor, start_date: str, end_date: str) -> List[Dict]:
     """根据日期范围查找订单"""
-    conn = get_connection()
-    cursor = conn.cursor()
-    try:
-        cursor.execute('''
-        SELECT * FROM orders 
-        WHERE date >= ? AND date <= ?
-        ORDER BY date DESC
-        ''', (start_date, end_date))
-        rows = cursor.fetchall()
-        return [dict(row) for row in rows]
-    finally:
-        conn.close()
+    cursor.execute('''
+    SELECT * FROM orders 
+    WHERE date >= ? AND date <= ?
+    ORDER BY date DESC
+    ''', (start_date, end_date))
+    rows = cursor.fetchall()
+    return [dict(row) for row in rows]
 
 
-def search_orders_by_customer(customer: str) -> List[Dict]:
+@db_query
+def search_orders_by_customer(conn, cursor, customer: str) -> List[Dict]:
     """根据客户类型查找订单"""
-    conn = get_connection()
-    cursor = conn.cursor()
-    try:
-        cursor.execute(
-            'SELECT * FROM orders WHERE customer = ? ORDER BY date DESC', (customer.upper(),))
-        rows = cursor.fetchall()
-        return [dict(row) for row in rows]
-    finally:
-        conn.close()
+    cursor.execute(
+        'SELECT * FROM orders WHERE customer = ? ORDER BY date DESC', (customer.upper(),))
+    rows = cursor.fetchall()
+    return [dict(row) for row in rows]
 
 
-def search_orders_by_state(state: str) -> List[Dict]:
+@db_query
+def search_orders_by_state(conn, cursor, state: str) -> List[Dict]:
     """根据状态查找订单"""
-    conn = get_connection()
-    cursor = conn.cursor()
-    try:
-        cursor.execute(
-            'SELECT * FROM orders WHERE state = ? ORDER BY date DESC', (state,))
-        rows = cursor.fetchall()
-        return [dict(row) for row in rows]
-    finally:
-        conn.close()
+    cursor.execute(
+        'SELECT * FROM orders WHERE state = ? ORDER BY date DESC', (state,))
+    rows = cursor.fetchall()
+    return [dict(row) for row in rows]
 
 
-def search_orders_all() -> List[Dict]:
+@db_query
+def search_orders_all(conn, cursor) -> List[Dict]:
     """查找所有订单"""
-    conn = get_connection()
-    cursor = conn.cursor()
-    try:
-        cursor.execute('SELECT * FROM orders ORDER BY date DESC')
-        rows = cursor.fetchall()
-        return [dict(row) for row in rows]
-    finally:
-        conn.close()
+    cursor.execute('SELECT * FROM orders ORDER BY date DESC')
+    rows = cursor.fetchall()
+    return [dict(row) for row in rows]
 
 
-# ========== 订单ID生成 ==========
+@db_query
+def search_orders_advanced(conn, cursor, criteria: Dict) -> List[Dict]:
+    """
+    高级查找订单（支持混合条件）
+    criteria: 字典，包含可选键：
+        - group_id: str
+        - state: str
+        - customer: str
+        - order_id: str
+        - date_range: tuple(start_date, end_date)
+    """
+    query = "SELECT * FROM orders WHERE 1=1"
+    params = []
 
-def get_next_order_id() -> str:
-    """获取下一个订单ID"""
-    conn = get_connection()
-    cursor = conn.cursor()
-    try:
-        cursor.execute(
-            'UPDATE order_counter SET counter = counter + 1 WHERE id = 1')
-        cursor.execute('SELECT counter FROM order_counter WHERE id = 1')
-        counter = cursor.fetchone()[0]
-        conn.commit()
-        return f"{counter:04d}"
-    finally:
-        conn.close()
+    if 'group_id' in criteria and criteria['group_id']:
+        query += " AND group_id = ?"
+        params.append(criteria['group_id'])
 
+    if 'state' in criteria and criteria['state']:
+        query += " AND state = ?"
+        params.append(criteria['state'])
+    else:
+        # 默认排除完成和违约完成的订单
+        query += " AND state NOT IN ('end', 'breach_end')"
+
+    if 'customer' in criteria and criteria['customer']:
+        query += " AND customer = ?"
+        params.append(criteria['customer'])
+
+    if 'order_id' in criteria and criteria['order_id']:
+        query += " AND order_id = ?"
+        params.append(criteria['order_id'])
+
+    if 'date_range' in criteria and criteria['date_range']:
+        start_date, end_date = criteria['date_range']
+        query += " AND date >= ? AND date <= ?"
+        params.extend([start_date, end_date])
+
+    if 'weekday_group' in criteria and criteria['weekday_group']:
+        query += " AND weekday_group = ?"
+        params.append(criteria['weekday_group'])
+
+    query += " ORDER BY date DESC"
+
+    cursor.execute(query, params)
+    rows = cursor.fetchall()
+    return [dict(row) for row in rows]
 
 # ========== 财务数据操作 ==========
 
-def get_financial_data() -> Dict:
+
+@db_query
+def get_financial_data(conn, cursor) -> Dict:
     """获取全局财务数据"""
-    conn = get_connection()
-    cursor = conn.cursor()
-    try:
-        cursor.execute('SELECT * FROM financial_data ORDER BY id DESC LIMIT 1')
+    cursor.execute('SELECT * FROM financial_data ORDER BY id DESC LIMIT 1')
+    row = cursor.fetchone()
+    if row:
+        return dict(row)
+    # 如果不存在，返回默认值
+    return {
+        'valid_orders': 0,
+        'valid_amount': 0,
+        'liquid_funds': 0,
+        'new_clients': 0,
+        'new_clients_amount': 0,
+        'old_clients': 0,
+        'old_clients_amount': 0,
+        'interest': 0,
+        'completed_orders': 0,
+        'completed_amount': 0,
+        'breach_orders': 0,
+        'breach_amount': 0,
+        'breach_end_orders': 0,
+        'breach_end_amount': 0
+    }
+
+
+@db_transaction
+def update_financial_data(conn, cursor, field: str, amount: float) -> bool:
+    """更新财务数据字段"""
+    # 先获取当前值
+    cursor.execute('SELECT * FROM financial_data ORDER BY id DESC LIMIT 1')
+    row = cursor.fetchone()
+    if not row:
+        # 如果不存在，创建新记录
+        cursor.execute('''
+        INSERT INTO financial_data (
+            valid_orders, valid_amount, liquid_funds,
+            new_clients, new_clients_amount,
+            old_clients, old_clients_amount,
+            interest, completed_orders, completed_amount,
+            breach_orders, breach_amount,
+            breach_end_orders, breach_end_amount
+        ) VALUES (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        ''')
+        conn.commit()
+        current_value = 0
+    else:
+        row_dict = dict(row)
+        current_value = row_dict.get(field, 0)
+
+    # 更新值
+    new_value = current_value + amount
+    # 使用参数化查询防止SQL注入
+    cursor.execute(f'''
+    UPDATE financial_data 
+    SET "{field}" = ?, updated_at = CURRENT_TIMESTAMP
+    WHERE id = (SELECT id FROM financial_data ORDER BY id DESC LIMIT 1)
+    ''', (new_value,))
+    conn.commit()
+    return True
+
+# ========== 分组数据操作 ==========
+
+
+@db_query
+def get_grouped_data(conn, cursor, group_id: Optional[str] = None) -> Dict:
+    """获取分组数据"""
+    if group_id:
+        cursor.execute(
+            'SELECT * FROM grouped_data WHERE group_id = ?', (group_id,))
         row = cursor.fetchone()
         if row:
             return dict(row)
         # 如果不存在，返回默认值
         return {
+            'group_id': group_id,
             'valid_orders': 0,
             'valid_amount': 0,
             'liquid_funds': 0,
@@ -238,242 +326,341 @@ def get_financial_data() -> Dict:
             'breach_end_orders': 0,
             'breach_end_amount': 0
         }
-    finally:
-        conn.close()
-
-
-def update_financial_data(field: str, amount: float) -> bool:
-    """更新财务数据字段"""
-    conn = get_connection()
-    cursor = conn.cursor()
-    try:
-        # 先获取当前值
-        cursor.execute('SELECT * FROM financial_data ORDER BY id DESC LIMIT 1')
-        row = cursor.fetchone()
-        if not row:
-            # 如果不存在，创建新记录
-            cursor.execute('''
-            INSERT INTO financial_data (
-                valid_orders, valid_amount, liquid_funds,
-                new_clients, new_clients_amount,
-                old_clients, old_clients_amount,
-                interest, completed_orders, completed_amount,
-                breach_orders, breach_amount,
-                breach_end_orders, breach_end_amount
-            ) VALUES (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
-            ''')
-            conn.commit()
-            current_value = 0
-        else:
-            row_dict = dict(row)
-            current_value = row_dict.get(field, 0)
-
-        # 更新值
-        new_value = current_value + amount
-        # 使用参数化查询防止SQL注入
-        cursor.execute(f'''
-        UPDATE financial_data 
-        SET "{field}" = ?, updated_at = CURRENT_TIMESTAMP
-        WHERE id = (SELECT id FROM financial_data ORDER BY id DESC LIMIT 1)
-        ''', (new_value,))
-        conn.commit()
-        return True
-    except Exception as e:
-        print(f"更新财务数据错误: {e}")
-        return False
-    finally:
-        conn.close()
-
-
-# ========== 分组数据操作 ==========
-
-def get_grouped_data(group_id: Optional[str] = None) -> Dict:
-    """获取分组数据"""
-    conn = get_connection()
-    cursor = conn.cursor()
-    try:
-        if group_id:
-            cursor.execute(
-                'SELECT * FROM grouped_data WHERE group_id = ?', (group_id,))
-            row = cursor.fetchone()
-            if row:
-                return dict(row)
-            # 如果不存在，返回默认值
-            return {
-                'group_id': group_id,
-                'valid_orders': 0,
-                'valid_amount': 0,
-                'liquid_funds': 0,
-                'new_clients': 0,
-                'new_clients_amount': 0,
-                'old_clients': 0,
-                'old_clients_amount': 0,
-                'interest': 0,
-                'completed_orders': 0,
-                'completed_amount': 0,
-                'breach_orders': 0,
-                'breach_amount': 0,
-                'breach_end_orders': 0,
-                'breach_end_amount': 0
-            }
-        else:
-            # 获取所有分组数据
-            cursor.execute('SELECT * FROM grouped_data')
-            rows = cursor.fetchall()
-            result = {}
-            for row in rows:
-                result[row['group_id']] = dict(row)
-            return result
-    finally:
-        conn.close()
-
-
-def update_grouped_data(group_id: str, field: str, amount: float) -> bool:
-    """更新分组数据字段"""
-    conn = get_connection()
-    cursor = conn.cursor()
-    try:
-        # 检查分组是否存在
-        cursor.execute(
-            'SELECT * FROM grouped_data WHERE group_id = ?', (group_id,))
-        row = cursor.fetchone()
-
-        if not row:
-            # 如果不存在，创建新记录
-            cursor.execute('''
-            INSERT INTO grouped_data (
-                group_id, valid_orders, valid_amount, liquid_funds,
-                new_clients, new_clients_amount,
-                old_clients, old_clients_amount,
-                interest, completed_orders, completed_amount,
-                breach_orders, breach_amount,
-                breach_end_orders, breach_end_amount
-            ) VALUES (?, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
-            ''', (group_id,))
-            conn.commit()
-            current_value = 0
-        else:
-            row_dict = dict(row)
-            current_value = row_dict.get(field, 0)
-
-        # 更新值
-        new_value = current_value + amount
-        # 使用参数化查询防止SQL注入
-        cursor.execute(f'''
-        UPDATE grouped_data 
-        SET "{field}" = ?, updated_at = CURRENT_TIMESTAMP
-        WHERE group_id = ?
-        ''', (new_value, group_id))
-        conn.commit()
-        return True
-    except Exception as e:
-        print(f"更新分组数据错误: {e}")
-        return False
-    finally:
-        conn.close()
-
-
-def get_all_group_ids() -> List[str]:
-    """获取所有归属ID列表"""
-    conn = get_connection()
-    cursor = conn.cursor()
-    try:
-        cursor.execute(
-            'SELECT DISTINCT group_id FROM grouped_data ORDER BY group_id')
+    else:
+        # 获取所有分组数据
+        cursor.execute('SELECT * FROM grouped_data')
         rows = cursor.fetchall()
-        return [row[0] for row in rows]
-    finally:
-        conn.close()
+        result = {}
+        for row in rows:
+            result[row['group_id']] = dict(row)
+        return result
 
+
+@db_transaction
+def update_grouped_data(conn, cursor, group_id: str, field: str, amount: float) -> bool:
+    """更新分组数据字段"""
+    # 检查分组是否存在
+    cursor.execute(
+        'SELECT * FROM grouped_data WHERE group_id = ?', (group_id,))
+    row = cursor.fetchone()
+
+    if not row:
+        # 如果不存在，创建新记录
+        cursor.execute('''
+        INSERT INTO grouped_data (
+            group_id, valid_orders, valid_amount, liquid_funds,
+            new_clients, new_clients_amount,
+            old_clients, old_clients_amount,
+            interest, completed_orders, completed_amount,
+            breach_orders, breach_amount,
+            breach_end_orders, breach_end_amount
+        ) VALUES (?, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        ''', (group_id,))
+        conn.commit()
+        current_value = 0
+    else:
+        row_dict = dict(row)
+        current_value = row_dict.get(field, 0)
+
+    # 更新值
+    new_value = current_value + amount
+    # 使用参数化查询防止SQL注入
+    cursor.execute(f'''
+    UPDATE grouped_data 
+    SET "{field}" = ?, updated_at = CURRENT_TIMESTAMP
+    WHERE group_id = ?
+    ''', (new_value, group_id))
+    conn.commit()
+    return True
+
+
+@db_query
+def get_all_group_ids(conn, cursor) -> List[str]:
+    """获取所有归属ID列表"""
+    cursor.execute(
+        'SELECT DISTINCT group_id FROM grouped_data ORDER BY group_id')
+    rows = cursor.fetchall()
+    return [row[0] for row in rows]
 
 # ========== 日结数据操作 ==========
 
-def get_daily_data(date: str, group_id: Optional[str] = None) -> Dict:
+
+@db_query
+def get_daily_data(conn, cursor, date: str, group_id: Optional[str] = None) -> Dict:
     """获取日结数据（11:00-23:00为一个周期）"""
-    conn = get_connection()
-    cursor = conn.cursor()
-    try:
-        if group_id:
-            cursor.execute(
-                'SELECT * FROM daily_data WHERE date = ? AND group_id = ?', (date, group_id))
-        else:
-            # 全局日结数据（group_id为NULL）
-            cursor.execute(
-                'SELECT * FROM daily_data WHERE date = ? AND group_id IS NULL', (date,))
+    if group_id:
+        cursor.execute(
+            'SELECT * FROM daily_data WHERE date = ? AND group_id = ?', (date, group_id))
+    else:
+        # 全局日结数据（group_id为NULL）
+        cursor.execute(
+            'SELECT * FROM daily_data WHERE date = ? AND group_id IS NULL', (date,))
 
-        row = cursor.fetchone()
-        if row:
-            return dict(row)
+    row = cursor.fetchone()
+    if row:
+        return dict(row)
 
-        # 如果不存在，返回默认值
-        return {
-            'new_clients': 0,
-            'new_clients_amount': 0,
-            'old_clients': 0,
-            'old_clients_amount': 0,
-            'interest': 0,
-            'completed_orders': 0,
-            'completed_amount': 0,
-            'breach_orders': 0,
-            'breach_amount': 0,
-            'breach_end_orders': 0,
-            'breach_end_amount': 0
-        }
-    finally:
-        conn.close()
+    # 如果不存在，返回默认值
+    return {
+        'new_clients': 0,
+        'new_clients_amount': 0,
+        'old_clients': 0,
+        'old_clients_amount': 0,
+        'interest': 0,
+        'completed_orders': 0,
+        'completed_amount': 0,
+        'breach_orders': 0,
+        'breach_amount': 0,
+        'breach_end_orders': 0,
+        'breach_end_amount': 0,
+        'liquid_flow': 0,
+        'company_expenses': 0,
+        'other_expenses': 0
+    }
 
 
-def update_daily_data(date: str, field: str, amount: float, group_id: Optional[str] = None) -> bool:
+@db_transaction
+def update_daily_data(conn, cursor, date: str, field: str, amount: float, group_id: Optional[str] = None) -> bool:
     """更新日结数据字段"""
-    conn = get_connection()
-    cursor = conn.cursor()
-    try:
-        # 检查记录是否存在
-        if group_id:
-            cursor.execute(
-                'SELECT * FROM daily_data WHERE date = ? AND group_id = ?', (date, group_id))
-        else:
-            cursor.execute(
-                'SELECT * FROM daily_data WHERE date = ? AND group_id IS NULL', (date,))
+    # 检查记录是否存在
+    if group_id:
+        cursor.execute(
+            'SELECT * FROM daily_data WHERE date = ? AND group_id = ?', (date, group_id))
+    else:
+        cursor.execute(
+            'SELECT * FROM daily_data WHERE date = ? AND group_id IS NULL', (date,))
 
-        row = cursor.fetchone()
+    row = cursor.fetchone()
 
-        if not row:
-            # 如果不存在，创建新记录
-            cursor.execute('''
-            INSERT INTO daily_data (
-                date, group_id, new_clients, new_clients_amount,
-                old_clients, old_clients_amount,
-                interest, completed_orders, completed_amount,
-                breach_orders, breach_amount,
-                breach_end_orders, breach_end_amount
-            ) VALUES (?, ?, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
-            ''', (date, group_id))
-            conn.commit()
-            current_value = 0
-        else:
-            row_dict = dict(row)
-            current_value = row_dict.get(field, 0)
-
-        # 更新值
-        new_value = current_value + amount
-        if group_id:
-            cursor.execute(f'''
-            UPDATE daily_data 
-            SET "{field}" = ?, updated_at = CURRENT_TIMESTAMP
-            WHERE date = ? AND group_id = ?
-            ''', (new_value, date, group_id))
-        else:
-            cursor.execute(f'''
-            UPDATE daily_data 
-            SET "{field}" = ?, updated_at = CURRENT_TIMESTAMP
-            WHERE date = ? AND group_id IS NULL
-            ''', (new_value, date))
-
+    if not row:
+        # 如果不存在，创建新记录
+        cursor.execute('''
+        INSERT INTO daily_data (
+            date, group_id, new_clients, new_clients_amount,
+            old_clients, old_clients_amount,
+            interest, completed_orders, completed_amount,
+            breach_orders, breach_amount,
+            breach_end_orders, breach_end_amount,
+            liquid_flow, company_expenses, other_expenses
+        ) VALUES (?, ?, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        ''', (date, group_id))
         conn.commit()
-        return True
-    except Exception as e:
-        print(f"更新日结数据错误: {e}")
-        return False
-    finally:
-        conn.close()
+        current_value = 0
+    else:
+        row_dict = dict(row)
+        current_value = row_dict.get(field, 0)
+
+    # 更新值
+    new_value = current_value + amount
+    if group_id:
+        cursor.execute(f'''
+        UPDATE daily_data 
+        SET "{field}" = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE date = ? AND group_id = ?
+        ''', (new_value, date, group_id))
+    else:
+        cursor.execute(f'''
+        UPDATE daily_data 
+        SET "{field}" = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE date = ? AND group_id IS NULL
+        ''', (new_value, date))
+
+    conn.commit()
+    return True
+
+
+@db_query
+def get_stats_by_date_range(conn, cursor, start_date: str, end_date: str, group_id: Optional[str] = None) -> Dict:
+    """
+    根据日期范围聚合统计数据
+    :param start_date: 开始日期 (YYYY-MM-DD)
+    :param end_date: 结束日期 (YYYY-MM-DD)
+    :param group_id: 可选，指定归属ID
+    :return: 聚合后的统计字典
+    """
+    # 构建查询条件
+    where_clause = "date >= ? AND date <= ?"
+    params = [start_date, end_date]
+
+    if group_id:
+        where_clause += " AND group_id = ?"
+        params.append(group_id)
+    else:
+        where_clause += " AND group_id IS NULL"
+
+    cursor.execute(f'''
+    SELECT 
+        SUM(new_clients) as new_clients,
+        SUM(new_clients_amount) as new_clients_amount,
+        SUM(old_clients) as old_clients,
+        SUM(old_clients_amount) as old_clients_amount,
+        SUM(interest) as interest,
+        SUM(completed_orders) as completed_orders,
+        SUM(completed_amount) as completed_amount,
+        SUM(breach_orders) as breach_orders,
+        SUM(breach_amount) as breach_amount,
+        SUM(breach_end_orders) as breach_end_orders,
+        SUM(breach_end_amount) as breach_end_amount,
+        SUM(liquid_flow) as liquid_flow,
+        SUM(company_expenses) as company_expenses,
+        SUM(other_expenses) as other_expenses
+    FROM daily_data 
+    WHERE {where_clause}
+    ''', params)
+
+    row = cursor.fetchone()
+
+    # 将结果转换为字典，None转为0
+    result = {}
+    keys = [
+        'new_clients', 'new_clients_amount',
+        'old_clients', 'old_clients_amount',
+        'interest',
+        'completed_orders', 'completed_amount',
+        'breach_orders', 'breach_amount',
+        'breach_end_orders', 'breach_end_amount',
+        'liquid_flow', 'company_expenses', 'other_expenses'
+    ]
+
+    for i, key in enumerate(keys):
+        result[key] = row[i] if row[i] is not None else 0
+
+    return result
+
+# ========== 授权用户操作 ==========
+
+
+@db_transaction
+def add_authorized_user(conn, cursor, user_id: int) -> bool:
+    """添加授权用户"""
+    cursor.execute(
+        'INSERT OR IGNORE INTO authorized_users (user_id) VALUES (?)', (user_id,))
+    conn.commit()
+    return True
+
+
+@db_transaction
+def remove_authorized_user(conn, cursor, user_id: int) -> bool:
+    """移除授权用户"""
+    cursor.execute(
+        'DELETE FROM authorized_users WHERE user_id = ?', (user_id,))
+    conn.commit()
+    return True
+
+
+@db_query
+def get_authorized_users(conn, cursor) -> List[int]:
+    """获取所有授权用户ID"""
+    cursor.execute('SELECT user_id FROM authorized_users')
+    rows = cursor.fetchall()
+    return [row[0] for row in rows]
+
+
+@db_query
+def is_user_authorized(conn, cursor, user_id: int) -> bool:
+    """检查用户是否授权"""
+    cursor.execute(
+        'SELECT 1 FROM authorized_users WHERE user_id = ?', (user_id,))
+    return cursor.fetchone() is not None
+
+
+@db_transaction
+def record_expense(conn, cursor, date: str, type: str, amount: float, note: str) -> bool:
+    """记录开销"""
+    # 1. 插入详细记录
+    cursor.execute('''
+    INSERT INTO expense_records (date, type, amount, note)
+    VALUES (?, ?, ?, ?)
+    ''', (date, type, amount, note))
+    
+    # 2. 更新日结数据
+    field = 'company_expenses' if type == 'company' else 'other_expenses'
+    
+    # 复用 update_daily_data 逻辑的简化版
+    cursor.execute(
+        'SELECT * FROM daily_data WHERE date = ? AND group_id IS NULL', (date,))
+    row = cursor.fetchone()
+    
+    if not row:
+        cursor.execute('''
+        INSERT INTO daily_data (
+            date, group_id, new_clients, new_clients_amount,
+            old_clients, old_clients_amount,
+            interest, completed_orders, completed_amount,
+            breach_orders, breach_amount,
+            breach_end_orders, breach_end_amount,
+            liquid_flow, company_expenses, other_expenses
+        ) VALUES (?, NULL, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ?, ?)
+        ''', (date, amount if field == 'company_expenses' else 0, amount if field == 'other_expenses' else 0))
+    else:
+        cursor.execute(f'''
+        UPDATE daily_data 
+        SET "{field}" = "{field}" + ?, updated_at = CURRENT_TIMESTAMP
+        WHERE date = ? AND group_id IS NULL
+        ''', (amount, date))
+
+    # 3. 更新全局流动资金 (扣除开销)
+    # 注意：update_financial_data 有装饰器 @db_transaction，
+    # 而 record_expense 也有 @db_transaction。
+    # SQLite 不支持嵌套事务，所以我们需要直接在这里执行 SQL，或者复用传入的 cursor。
+    
+    # update_financial_data 逻辑复制如下：
+    
+    # 先获取当前值
+    cursor.execute('SELECT * FROM financial_data ORDER BY id DESC LIMIT 1')
+    row = cursor.fetchone()
+    if not row:
+        # 如果不存在，创建新记录
+        cursor.execute('''
+        INSERT INTO financial_data (
+            valid_orders, valid_amount, liquid_funds,
+            new_clients, new_clients_amount,
+            old_clients, old_clients_amount,
+            interest, completed_orders, completed_amount,
+            breach_orders, breach_amount,
+            breach_end_orders, breach_end_amount
+        ) VALUES (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        ''')
+        # conn.commit() # 不要在事务中 commit
+        current_value = 0
+    else:
+        row_dict = dict(row)
+        current_value = row_dict.get('liquid_funds', 0)
+
+    # 更新值 (减少)
+    new_value = current_value - amount
+    
+    # 使用参数化查询防止SQL注入
+    cursor.execute('''
+    UPDATE financial_data 
+    SET "liquid_funds" = ?, updated_at = CURRENT_TIMESTAMP
+    WHERE id = (SELECT id FROM financial_data ORDER BY id DESC LIMIT 1)
+    ''', (new_value,))
+    
+    conn.commit()
+    return True
+
+
+@db_query
+def get_expense_records(conn, cursor, start_date: str, end_date: str = None, type: Optional[str] = None) -> List[Dict]:
+    """获取开销记录（支持日期范围）"""
+    query = "SELECT * FROM expense_records WHERE date >= ?"
+    params = [start_date]
+    
+    if end_date:
+        query += " AND date <= ?"
+        params.append(end_date)
+    else:
+        # 如果没有结束日期，就只查开始日期那一天
+        query += " AND date <= ?"
+        params.append(start_date)
+    
+    if type:
+        query += " AND type = ?"
+        params.append(type)
+        
+    query += " ORDER BY date DESC, created_at ASC"
+    
+    cursor.execute(query, params)
+    rows = cursor.fetchall()
+    return [dict(row) for row in rows]

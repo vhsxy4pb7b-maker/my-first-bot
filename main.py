@@ -172,6 +172,17 @@ def private_chat_only(func):
     return wrapped
 
 
+def group_chat_only(func):
+    """检查是否在群组中使用命令的装饰器"""
+    @wraps(func)
+    async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        if not is_group_chat(update):
+            await update.message.reply_text("⚠️ 此命令只能在群组中使用")
+            return
+        return await func(update, context, *args, **kwargs)
+    return wrapped
+
+
 def get_current_group():
     """获取当前星期对应的分组"""
     today = date.today().weekday()
@@ -208,6 +219,16 @@ def get_daily_period_date() -> str:
         period_date = now.strftime("%Y-%m-%d")
 
     return period_date
+
+
+def update_liquid_capital(amount: float):
+    """更新流动资金（全局余额 + 日结流量）"""
+    # 1. 全局余额 (Cash Balance)
+    db_operations.update_financial_data('liquid_funds', amount)
+
+    # 2. 日结流量 (Liquid Flow)
+    date = get_daily_period_date()
+    db_operations.update_daily_data(date, 'liquid_flow', amount, None)
 
 
 def update_all_stats(field: str, amount: float, count: int = 0, group_id: str = None):
@@ -449,7 +470,7 @@ async def create_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     update_all_stats('valid', amount, 1, group_id)
 
     # 2. 流动资金减少（全局+分组）
-    db_operations.update_financial_data('liquid_funds', -amount)
+    update_liquid_capital(-amount)
     # update_grouped_data(group_id, 'liquid_funds', -amount) # 分组表也有liquid_funds
 
     # 3. 客户统计（全局+日结+分组）
@@ -484,6 +505,11 @@ async def create_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_amount_operation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """处理金额操作（需要管理员权限）"""
+    # 检查是否在群组中 (利息操作可能可以在私聊? 不，为了关联ID，最好也在群里，或者私聊不支持)
+    # 根据需求"私聊界面不可以有任何订单"，这里也限制
+    if not is_group_chat(update):
+        return
+
     # 检查是否有消息对象
     if not update.message or not update.message.text:
         return
@@ -533,15 +559,15 @@ async def handle_amount_operation(update: Update, context: ContextTypes.DEFAULT_
                 return
             amount = float(amount_text[:-1])
             await process_principal_reduction(update, order, amount)
-        elif amount_text.endswith('c'):
-            # 违约协商还款 - 需要订单
-            if not order:
-                message = "❌ Failed: No active order in this group." if is_group_chat(
-                    update) else "❌ 本群没有订单，无法进行违约协商还款操作"
-                await update.message.reply_text(message)
-                return
-            amount = float(amount_text[:-1])
-            await process_breach_payment(update, order, amount)
+        # elif amount_text.endswith('c'):
+        #     # 违约协商还款 - 需要订单
+        #     if not order:
+        #         message = "❌ Failed: No active order in this group." if is_group_chat(
+        #             update) else "❌ 本群没有订单，无法进行违约协商还款操作"
+        #         await update.message.reply_text(message)
+        #         return
+        #     amount = float(amount_text[:-1])
+        #     await process_breach_payment(update, order, amount)
         else:
             # 利息收入 - 不需要订单，但如果有订单会关联到订单的归属ID
             try:
@@ -552,7 +578,7 @@ async def handle_amount_operation(update: Update, context: ContextTypes.DEFAULT_
                 else:
                     # 如果没有订单，更新全局和日结数据
                     update_all_stats('interest', amount, 0, None)
-                    db_operations.update_financial_data('liquid_funds', amount)
+                    update_liquid_capital(amount)
                     # 群组只回复成功，私聊显示详情
                     if is_group_chat(update):
                         await update.message.reply_text("✅ Success")
@@ -616,7 +642,7 @@ async def process_principal_reduction(update: Update, order: dict, amount: float
         update_all_stats('completed', amount, 0, group_id)
 
         # 3. 流动资金增加
-        db_operations.update_financial_data('liquid_funds', amount)
+        update_liquid_capital(amount)
 
         # 群组只回复成功，私聊显示详情
         if is_group_chat(update):
@@ -669,7 +695,7 @@ async def process_breach_payment(update: Update, order: dict, amount: float):
         update_all_stats('breach_end', amount, 1, group_id)
 
         # 2. 流动资金增加
-        db_operations.update_financial_data('liquid_funds', amount)
+        update_liquid_capital(amount)
 
         # 群组只回复成功，私聊显示详情
         if is_group_chat(update):
@@ -702,7 +728,7 @@ async def process_interest(update: Update, order: dict, amount: float):
         update_all_stats('interest', amount, 0, group_id)
 
         # 2. 流动资金增加
-        db_operations.update_financial_data('liquid_funds', amount)
+        update_liquid_capital(amount)
 
         # 群组只回复成功，私聊显示详情
         if is_group_chat(update):
@@ -827,7 +853,7 @@ async def set_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
     update_all_stats('completed', amount, 1, group_id)
 
     # 3. 流动资金增加
-    db_operations.update_financial_data('liquid_funds', amount)
+    update_liquid_capital(amount)
 
     # 群组只回复成功，私聊显示详情
     if is_group_chat(update):
@@ -880,7 +906,7 @@ async def set_breach(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def set_breach_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """违约订单完成"""
+    """违约订单完成 - 步骤1：请求金额"""
     chat_id = update.message.chat_id
 
     order = db_operations.get_order_by_chat_id(chat_id)
@@ -896,22 +922,18 @@ async def set_breach_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(message)
         return
 
-    # 更新订单状态
-    db_operations.update_order_state(chat_id, 'breach_end')
-    group_id = order['group_id']
-
-    # 违约完成订单增加
-    update_all_stats('breach_end', 0, 1, group_id)
-
-    # 群组只回复成功，私聊显示详情
+    # 询问金额
     if is_group_chat(update):
-        await update.message.reply_text("✅ Breach Order Ended")
-    else:
         await update.message.reply_text(
-            f"违约订单已完成！\n"
-            f"订单ID: {order['order_id']}\n"
-            f"状态: breach_end"
+            "Please enter the final amount for this breach order (e.g., 5000).\n"
+            "This amount will be recorded as liquid capital inflow."
         )
+    else:
+        await update.message.reply_text("请输入违约完成金额（含本金+收益）：")
+
+    # 设置状态，等待输入
+    context.user_data['state'] = 'WAITING_BREACH_END_AMOUNT'
+    context.user_data['breach_end_chat_id'] = chat_id
 
 
 async def generate_report_text(period_type: str, start_date: str, end_date: str, group_id: str = None) -> str:
@@ -946,12 +968,12 @@ async def generate_report_text(period_type: str, start_date: str, end_date: str,
         f"=== {report_title} ===\n"
         f"📅 {now}\n"
         f"{'─' * 25}\n"
-        f"💰 【资金状况】\n"
-        f"流动资金: {current_data['liquid_funds']:.2f}\n"
+        f"💰 【当前状态】\n"
         f"有效订单数: {current_data['valid_orders']}\n"
         f"有效订单金额: {current_data['valid_amount']:.2f}\n"
         f"{'─' * 25}\n"
         f"📈 【{period_display}】\n"
+        f"流动资金: {stats['liquid_flow']:.2f}\n"
         f"新客户数: {stats['new_clients']}\n"
         f"新客户金额: {stats['new_clients_amount']:.2f}\n"
         f"老客户数: {stats['old_clients']}\n"
@@ -963,6 +985,11 @@ async def generate_report_text(period_type: str, start_date: str, end_date: str,
         f"违约订单金额: {stats['breach_amount']:.2f}\n"
         f"违约完成订单数: {stats['breach_end_orders']}\n"
         f"违约完成金额: {stats['breach_end_amount']:.2f}\n"
+        f"{'─' * 25}\n"
+        f"💸 【开销与余额】\n"
+        f"公司开销: {stats['company_expenses']:.2f}\n"
+        f"其他开销: {stats['other_expenses']:.2f}\n"
+        f"现金余额: {current_data['liquid_funds']:.2f}\n"
     )
     return report
 
@@ -993,20 +1020,28 @@ async def show_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ],
         [
             InlineKeyboardButton(
+                "🏢 公司开销", callback_data="report_record_company"),
+            InlineKeyboardButton("📝 其他开销", callback_data="report_record_other")
+        ],
+        [
+            InlineKeyboardButton(
                 "🔍 查找 & 锁定", callback_data="search_lock_start"),
             InlineKeyboardButton("📢 群发通知", callback_data="broadcast_start")
         ]
     ]
 
-    # 如果是全局报表，显示分组查看按钮
+    # 如果是全局报表，显示归属查询按钮
     if not group_id:
-        group_ids = db_operations.get_all_group_ids()
-        # 分页显示或仅显示前几个，避免按钮过多
-        # 这里简单起见，显示一行一个，或者多行
-        row = []
-        for gid in sorted(group_ids):
-            keyboard.append([InlineKeyboardButton(
-                f"查看 {gid} 报表", callback_data=f"report_view_today_{gid}")])
+        keyboard.append([
+            InlineKeyboardButton(
+                "🔍 归属报表查询", callback_data="report_menu_attribution"),
+            InlineKeyboardButton(
+                "🔍 查找 & 锁定", callback_data="search_lock_start"),
+            InlineKeyboardButton("📢 群发通知", callback_data="broadcast_start")
+        ])
+    else:
+        keyboard.append([InlineKeyboardButton(
+            "🔙 返回全局", callback_data="report_view_today_ALL")])
 
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(report_text, reply_markup=reply_markup)
@@ -1197,6 +1232,191 @@ async def handle_report_callback(update: Update, context: ContextTypes.DEFAULT_T
     query = update.callback_query
     data = query.data
 
+    if data == "report_record_company":
+        date = get_daily_period_date()
+        records = db_operations.get_expense_records(date, date, 'company')
+
+        msg = f"🏢 今日公司开销 ({date}):\n\n"
+        if not records:
+            msg += "暂无记录\n"
+        else:
+            total = 0
+            for i, r in enumerate(records, 1):
+                msg += f"{i}. {r['amount']:.2f} - {r['note'] or '无备注'}\n"
+                total += r['amount']
+            msg += f"\n总计: {total:.2f}\n"
+
+        keyboard = [
+            [InlineKeyboardButton(
+                "➕ 新增开销", callback_data="report_add_expense_company")],
+            [
+                InlineKeyboardButton(
+                    "📅 本月", callback_data="report_expense_month_company"),
+                InlineKeyboardButton(
+                    "📆 查询", callback_data="report_expense_query_company")
+            ],
+            [InlineKeyboardButton(
+                "🔙 返回报表", callback_data="report_view_today_ALL")]
+        ]
+        await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    if data == "report_expense_month_company":
+        import pytz
+        tz = pytz.timezone('Asia/Shanghai')
+        now = datetime.now(tz)
+        start_date = now.replace(day=1).strftime("%Y-%m-%d")
+        end_date = get_daily_period_date()
+
+        records = db_operations.get_expense_records(
+            start_date, end_date, 'company')
+
+        msg = f"🏢 本月公司开销 ({start_date} 至 {end_date}):\n\n"
+        if not records:
+            msg += "暂无记录\n"
+        else:
+            total = 0
+            # 限制显示数量，防止消息过长
+            display_records = records[-20:] if len(records) > 20 else records
+
+            for r in display_records:
+                msg += f"[{r['date']}] {r['amount']:.2f} - {r['note'] or '无备注'}\n"
+                total += r['amount']
+
+            # 计算总额（所有记录）
+            real_total = sum(r['amount'] for r in records)
+            if len(records) > 20:
+                msg += f"\n... (共 {len(records)} 条记录，仅显示最近20条)\n"
+            msg += f"\n总计: {real_total:.2f}\n"
+
+        keyboard = [
+            [InlineKeyboardButton(
+                "🔙 返回", callback_data="report_record_company")]
+        ]
+        await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    if data == "report_expense_query_company":
+        await query.message.reply_text(
+            "🏢 请输入查询日期范围：\n"
+            "格式1 (单日): 2024-01-01\n"
+            "格式2 (范围): 2024-01-01 2024-01-31\n"
+            "输入 'cancel' 取消"
+        )
+        context.user_data['state'] = 'QUERY_EXPENSE_COMPANY'
+        return
+
+    if data == "report_add_expense_company":
+        await query.message.reply_text(
+            "🏢 请输入公司开销金额和备注：\n"
+            "格式：金额 备注\n"
+            "示例：100 服务器费用"
+        )
+        context.user_data['state'] = 'WAITING_EXPENSE_COMPANY'
+        return
+
+    if data == "report_record_other":
+        date = get_daily_period_date()
+        records = db_operations.get_expense_records(date, date, 'other')
+
+        msg = f"📝 今日其他开销 ({date}):\n\n"
+        if not records:
+            msg += "暂无记录\n"
+        else:
+            total = 0
+            for i, r in enumerate(records, 1):
+                msg += f"{i}. {r['amount']:.2f} - {r['note'] or '无备注'}\n"
+                total += r['amount']
+            msg += f"\n总计: {total:.2f}\n"
+
+        keyboard = [
+            [InlineKeyboardButton(
+                "➕ 新增开销", callback_data="report_add_expense_other")],
+            [
+                InlineKeyboardButton(
+                    "📅 本月", callback_data="report_expense_month_other"),
+                InlineKeyboardButton(
+                    "📆 查询", callback_data="report_expense_query_other")
+            ],
+            [InlineKeyboardButton(
+                "🔙 返回报表", callback_data="report_view_today_ALL")]
+        ]
+        await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    if data == "report_expense_month_other":
+        import pytz
+        tz = pytz.timezone('Asia/Shanghai')
+        now = datetime.now(tz)
+        start_date = now.replace(day=1).strftime("%Y-%m-%d")
+        end_date = get_daily_period_date()
+
+        records = db_operations.get_expense_records(
+            start_date, end_date, 'other')
+
+        msg = f"📝 本月其他开销 ({start_date} 至 {end_date}):\n\n"
+        if not records:
+            msg += "暂无记录\n"
+        else:
+            display_records = records[-20:] if len(records) > 20 else records
+            for r in display_records:
+                msg += f"[{r['date']}] {r['amount']:.2f} - {r['note'] or '无备注'}\n"
+
+            real_total = sum(r['amount'] for r in records)
+            if len(records) > 20:
+                msg += f"\n... (共 {len(records)} 条记录，仅显示最近20条)\n"
+            msg += f"\n总计: {real_total:.2f}\n"
+
+        keyboard = [
+            [InlineKeyboardButton("🔙 返回", callback_data="report_record_other")]
+        ]
+        await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    if data == "report_expense_query_other":
+        await query.message.reply_text(
+            "📝 请输入查询日期范围：\n"
+            "格式1 (单日): 2024-01-01\n"
+            "格式2 (范围): 2024-01-01 2024-01-31\n"
+            "输入 'cancel' 取消"
+        )
+        context.user_data['state'] = 'QUERY_EXPENSE_OTHER'
+        return
+
+    if data == "report_add_expense_other":
+        await query.message.reply_text(
+            "📝 请输入其他开销金额和备注：\n"
+            "格式：金额 备注\n"
+            "示例：50 办公用品"
+        )
+        context.user_data['state'] = 'WAITING_EXPENSE_OTHER'
+        return
+
+    if data == "report_menu_attribution":
+        group_ids = db_operations.get_all_group_ids()
+        if not group_ids:
+            await query.edit_message_text(
+                "⚠️ 暂无归属ID数据",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("🔙 返回", callback_data="report_view_today_ALL")]])
+            )
+            return
+
+        keyboard = []
+        row = []
+        for gid in sorted(group_ids):
+            row.append(InlineKeyboardButton(
+                gid, callback_data=f"report_view_today_{gid}"))
+            if len(row) == 4:
+                keyboard.append(row)
+                row = []
+        if row:
+            keyboard.append(row)
+        keyboard.append([InlineKeyboardButton(
+            "🔙 返回", callback_data="report_view_today_ALL")])
+        await query.edit_message_text("请选择归属ID查看报表：", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
     # 提取视图类型和参数
     # 格式: report_view_{type}_{group_id}
     # 或者旧格式: report_{group_id}
@@ -1225,11 +1445,19 @@ async def handle_report_callback(update: Update, context: ContextTypes.DEFAULT_T
                     "📅 本月报表", callback_data=f"report_view_month_{group_id if group_id else 'ALL'}"),
                 InlineKeyboardButton(
                     "📆 按日期查询", callback_data=f"report_view_query_{group_id if group_id else 'ALL'}")
+            ],
+            [
+                InlineKeyboardButton(
+                    "🏢 公司开销", callback_data="report_record_company"),
+                InlineKeyboardButton(
+                    "📝 其他开销", callback_data="report_record_other")
             ]
         ]
         # 全局视图添加通用按钮
         if not group_id:
             keyboard.append([
+                InlineKeyboardButton(
+                    "🔍 归属报表查询", callback_data="report_menu_attribution"),
                 InlineKeyboardButton(
                     "🔍 查找 & 锁定", callback_data="search_lock_start"),
                 InlineKeyboardButton("📢 群发通知", callback_data="broadcast_start")
@@ -1275,9 +1503,21 @@ async def handle_report_callback(update: Update, context: ContextTypes.DEFAULT_T
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """主按钮回调入口"""
     query = update.callback_query
-    await query.answer()
+
+    # 必须先 answer，防止客户端转圈
+    # 注意：如果 answer 抛错（比如过期），后面的逻辑可能不会执行，或者抛出异常被 error_handler 捕获
+    # 通常建议先执行逻辑再 answer，或者 answer 不带参数。
+    # 但在这里为了用户体验先 answer
+    try:
+        await query.answer()
+    except Exception:
+        pass  # 忽略 answer 错误（例如 query 已过期）
 
     data = query.data
+
+    # 记录日志以便排查
+    logger.info(
+        f"Processing callback: {data} from user {update.effective_user.id}")
 
     if data.startswith("search_"):
         await handle_search_callback(update, context)
@@ -1295,6 +1535,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "(输入 'cancel' 取消)"
         )
         context.user_data['state'] = 'BROADCASTING'
+    else:
+        logger.warning(f"Unhandled callback data: {data}")
+        await query.message.reply_text(f"⚠️ 未知的操作: {data}")
 
 
 async def show_current_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1345,7 +1588,7 @@ async def adjust_funds(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # 更新财务数据
-    db_operations.update_financial_data('liquid_funds', amount)
+    update_liquid_capital(amount)
 
     financial_data = db_operations.get_financial_data()
     await update.message.reply_text(
@@ -1416,12 +1659,166 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ 操作已取消")
         return
 
+    if user_state == 'WAITING_BREACH_END_AMOUNT':
+        try:
+            amount = float(text)
+            if amount <= 0:
+                await update.message.reply_text("❌ 金额必须大于0")
+                return
+
+            chat_id = context.user_data.get('breach_end_chat_id')
+            if not chat_id:
+                await update.message.reply_text("❌ 状态错误，请重新执行命令")
+                context.user_data['state'] = None
+                return
+
+            order = db_operations.get_order_by_chat_id(chat_id)
+            if not order or order['state'] != 'breach':
+                await update.message.reply_text("❌ 订单状态已改变或不存在")
+                context.user_data['state'] = None
+                return
+
+            # 执行完成逻辑
+            # 更新订单状态
+            db_operations.update_order_state(chat_id, 'breach_end')
+            group_id = order['group_id']
+
+            # 违约完成订单增加，金额增加
+            update_all_stats('breach_end', amount, 1, group_id)
+
+            # 更新流动资金 (Liquid Flow & Cash Balance)
+            update_liquid_capital(amount)
+
+            msg_en = f"✅ Breach Order Ended\nAmount: {amount:.2f}"
+            msg_cn = (
+                f"违约订单已完成！\n"
+                f"订单ID: {order['order_id']}\n"
+                f"完成金额: {amount:.2f}\n"
+                f"状态: breach_end"
+            )
+
+            # 如果是在群里操作的，或者需要通知群
+            # set_breach_end 记录的 chat_id 是订单所在的群/私聊ID
+            # 如果是在私聊中操作，但 update_liquid_capital 记录了...
+
+            # 我们直接回复当前操作者
+            await update.message.reply_text("✅ 操作成功")
+
+            # 如果当前聊天不是订单所在的聊天（例如私聊操作群订单），通知群组
+            if update.effective_chat.id != chat_id:
+                await context.bot.send_message(chat_id=chat_id, text=msg_en)
+            elif is_group_chat(update):
+                await update.message.reply_text(msg_en)
+            else:
+                await update.message.reply_text(msg_cn)
+
+            context.user_data['state'] = None
+
+        except ValueError:
+            await update.message.reply_text("❌ 请输入有效的数字金额")
+        except Exception as e:
+            logger.error(f"处理违约完成时出错: {e}", exc_info=True)
+            await update.message.reply_text(f"⚠️ 处理出错: {e}")
+        return
+
+    if user_state in ['QUERY_EXPENSE_COMPANY', 'QUERY_EXPENSE_OTHER']:
+        try:
+            dates = text.split()
+            if len(dates) == 1:
+                start_date = end_date = dates[0]
+            elif len(dates) == 2:
+                start_date = dates[0]
+                end_date = dates[1]
+            else:
+                await update.message.reply_text("❌ 格式错误。请输入 'YYYY-MM-DD' 或 'YYYY-MM-DD YYYY-MM-DD'")
+                return
+
+            # 验证日期格式
+            datetime.strptime(start_date, "%Y-%m-%d")
+            datetime.strptime(end_date, "%Y-%m-%d")
+
+            expense_type = 'company' if user_state == 'QUERY_EXPENSE_COMPANY' else 'other'
+            records = db_operations.get_expense_records(
+                start_date, end_date, expense_type)
+
+            title = "公司开销" if expense_type == 'company' else "其他开销"
+            msg = f"🔍 {title}查询 ({start_date} 至 {end_date}):\n\n"
+
+            if not records:
+                msg += "暂无记录\n"
+            else:
+                total = 0
+                # 限制显示数量，防止消息过长
+                display_records = records[-20:] if len(
+                    records) > 20 else records
+
+                for r in display_records:
+                    msg += f"[{r['date']}] {r['amount']:.2f} - {r['note'] or '无备注'}\n"
+                    total += r['amount']
+
+                # 计算总额（所有记录）
+                real_total = sum(r['amount'] for r in records)
+                if len(records) > 20:
+                    msg += f"\n... (共 {len(records)} 条记录，仅显示最近20条)\n"
+                msg += f"\n总计: {real_total:.2f}\n"
+
+            back_callback = "report_record_company" if expense_type == 'company' else "report_record_other"
+            keyboard = [[InlineKeyboardButton(
+                "🔙 返回", callback_data=back_callback)]]
+            await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
+            context.user_data['state'] = None
+
+        except ValueError:
+            await update.message.reply_text("❌ 日期格式错误，请使用 YYYY-MM-DD 格式")
+        except Exception as e:
+            logger.error(f"查询开销出错: {e}", exc_info=True)
+            await update.message.reply_text(f"⚠️ 查询出错: {e}")
+        return
+
+    if user_state in ['WAITING_EXPENSE_COMPANY', 'WAITING_EXPENSE_OTHER']:
+        try:
+            # 格式: 金额 备注
+            parts = text.strip().split(maxsplit=1)
+            if len(parts) < 2:
+                amount_str = parts[0]
+                note = "无备注"
+            else:
+                amount_str, note = parts
+
+            amount = float(amount_str)
+            if amount <= 0:
+                await update.message.reply_text("❌ 金额必须大于0")
+                return
+
+            expense_type = 'company' if user_state == 'WAITING_EXPENSE_COMPANY' else 'other'
+            date_str = get_daily_period_date()
+
+            # 记录开销
+            db_operations.record_expense(date_str, expense_type, amount, note)
+
+            financial_data = db_operations.get_financial_data()
+            await update.message.reply_text(
+                f"✅ 开销记录成功\n"
+                f"类型: {'公司开销' if expense_type == 'company' else '其他开销'}\n"
+                f"金额: {amount:.2f}\n"
+                f"备注: {note}\n"
+                f"当前现金余额: {financial_data['liquid_funds']:.2f}"
+            )
+            context.user_data['state'] = None
+
+        except ValueError:
+            await update.message.reply_text("❌ 金额格式错误。示例: 100 服务器费用")
+        except Exception as e:
+            logger.error(f"记录开销时出错: {e}", exc_info=True)
+            await update.message.reply_text(f"⚠️ 处理出错: {e}")
+        return
+
     if user_state == 'SEARCHING':
         # ... (keep existing search logic) ...
         # 解析搜索条件
         criteria = {}
         try:
-            # 支持 key=value 格式，也支持简单的单个值（为了兼容性，虽然提示是key=value）
+            # 支持 key=value 格式
             if '=' in text:
                 parts = text.split()
                 for part in parts:
@@ -1429,20 +1826,44 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         key, value = part.split('=', 1)
                         key = key.strip().lower()
                         value = value.strip()
-                        if key in ['group_id', 'state', 'customer', 'order_id']:
+
+                        # 映射别名
+                        if key == 'group':
+                            key = 'weekday_group'
+                            # 处理周一到周日的映射
+                            if value.startswith('周') and len(value) == 2:
+                                value = value[1]
+
+                        if key in ['group_id', 'state', 'customer', 'order_id', 'weekday_group']:
                             criteria[key] = value
             else:
-                # 尝试智能识别
-                # 如果是S开头加数字 -> group_id
-                # 如果是A或B -> customer
-                # 如果是状态词 -> state
-                # 否则 -> order_id
-                pass  # 暂时只支持 key=value 或依赖 /search 命令的解析逻辑
-                # 为了简单起见，这里要求用户使用 key=value 或者复用 search_orders 的逻辑
-                # 这里我们简单实现 key=value 解析，如果用户输入不带=，则提示错误
-                if not criteria:
-                    await update.message.reply_text("❌ 格式错误。请使用 `key=value` 格式，例如 `state=normal`", parse_mode='Markdown')
-                    return
+                # 智能识别
+                val = text.strip()
+                # 1. 星期分组 (一, 二... 或 周一, 周二...)
+                if val in ['一', '二', '三', '四', '五', '六', '日']:
+                    criteria['weekday_group'] = val
+                elif val.startswith('周') and len(val) == 2 and val[1] in ['一', '二', '三', '四', '五', '六', '日']:
+                    criteria['weekday_group'] = val[1]
+                # 2. 客户类型
+                elif val.upper() in ['A', 'B']:
+                    criteria['customer'] = val.upper()
+                # 3. 状态
+                elif val in ['normal', 'overdue', 'breach', 'end', 'breach_end', '正常', '逾期', '违约', '完成', '违约完成']:
+                    state_map = {
+                        '正常': 'normal', '逾期': 'overdue', '违约': 'breach',
+                        '完成': 'end', '违约完成': 'breach_end'
+                    }
+                    criteria['state'] = state_map.get(val, val)
+                # 4. 归属ID (S01)
+                elif len(val) == 3 and val[0].isalpha() and val[1:].isdigit():
+                    criteria['group_id'] = val.upper()
+                # 5. 默认按订单ID
+                else:
+                    criteria['order_id'] = val
+
+            if not criteria:
+                await update.message.reply_text("❌ 无法识别搜索条件", parse_mode='Markdown')
+                return
 
             orders = db_operations.search_orders_advanced(criteria)
 
@@ -1605,6 +2026,14 @@ async def search_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("请提供开始日期和结束日期 (格式: YYYY-MM-DD)")
                 return
             criteria['date_range'] = (context.args[1], context.args[2])
+        elif search_type == 'group':  # 支持按群组(星期)查找
+            if len(context.args) < 2:
+                await update.message.reply_text("请提供群组 (如: 一, 周一)")
+                return
+            val = context.args[1]
+            if val.startswith('周') and len(val) == 2:
+                val = val[1]
+            criteria['weekday_group'] = val
         else:
             await update.message.reply_text(f"未知的搜索类型: {search_type}")
             return
@@ -1664,19 +2093,19 @@ def main() -> None:
 
     # 订单操作命令（员工可用）
     application.add_handler(CommandHandler(
-        "create", authorized_required(create_order)))
+        "create", authorized_required(group_chat_only(create_order))))
     application.add_handler(CommandHandler(
-        "normal", authorized_required(set_normal)))
+        "normal", authorized_required(group_chat_only(set_normal))))
     application.add_handler(CommandHandler(
-        "overdue", authorized_required(set_overdue)))
+        "overdue", authorized_required(group_chat_only(set_overdue))))
     application.add_handler(CommandHandler(
-        "end", authorized_required(set_end)))
+        "end", authorized_required(group_chat_only(set_end))))
     application.add_handler(CommandHandler(
-        "breach", authorized_required(set_breach)))
+        "breach", authorized_required(group_chat_only(set_breach))))
     application.add_handler(CommandHandler(
-        "breach_end", authorized_required(set_breach_end)))
+        "breach_end", authorized_required(group_chat_only(set_breach_end))))
     application.add_handler(CommandHandler(
-        "order", authorized_required(show_current_order)))
+        "order", authorized_required(group_chat_only(show_current_order))))
 
     # 资金和归属ID管理（仅管理员）
     application.add_handler(CommandHandler(
@@ -1696,8 +2125,11 @@ def main() -> None:
 
     # 添加消息处理器（金额操作）- 需要管理员或员工权限
     # 只处理以 + 开头的消息（快捷操作）
+    # 修改：为了兼容私聊不处理金额操作，handle_amount_operation 已经添加了检查
+    # 这里保持不变，因为我们希望通过 filters 就过滤掉大部分非目标消息
     application.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND & filters.Regex(r'^\+'),
+        filters.TEXT & ~filters.COMMAND & filters.Regex(
+            r'^\+') & filters.ChatType.GROUPS,
         handle_amount_operation),
         group=1)  # 设置优先级组
 
