@@ -503,6 +503,164 @@ async def create_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(message)
 
 
+def parse_order_from_title(title: str):
+    """从群名解析订单信息"""
+    # 格式: 2403110105xxxx
+    # 240311 -> 2024-03-11
+    # 01 -> 序号
+    # 05 -> 金额 (k)
+    # 只要开头是10位数字即可
+    match = re.search(r'^(\d{6})(\d{2})(\d{2})', title)
+    if not match:
+        return None
+
+    date_part = match.group(1)  # YYMMDD
+    # seq_part = match.group(2)  # NN (unused)
+    amount_part = match.group(3)  # NN (k)
+
+    try:
+        # 假设 20YY
+        full_date_str = f"20{date_part}"
+        # 验证日期有效性
+        order_date_obj = datetime.strptime(full_date_str, "%Y%m%d").date()
+    except ValueError:
+        return None
+
+    amount = int(amount_part) * 1000
+
+    # 提取整个匹配到的10位数字作为订单ID
+    order_id = match.group(0)
+
+    return {
+        'date': order_date_obj,
+        'amount': amount,
+        'order_id': order_id,
+        'full_date_str': full_date_str  # YYYYMMDD
+    }
+
+
+async def handle_new_chat_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """处理新成员入群（机器人入群）"""
+    # 检查是否是机器人自己被添加
+    if not update.message.new_chat_members:
+        return
+
+    bot_id = context.bot.id
+    is_bot_added = False
+    for member in update.message.new_chat_members:
+        if member.id == bot_id:
+            is_bot_added = True
+            break
+
+    if not is_bot_added:
+        return
+
+    chat = update.effective_chat
+    chat_id = chat.id
+    chat_title = chat.title
+
+    if not chat_title:
+        return
+
+    logger.info(f"Bot added to group: {chat_title} ({chat_id})")
+
+    # 1. 解析群名
+    parsed_info = parse_order_from_title(chat_title)
+    if not parsed_info:
+        logger.info(
+            f"Group title {chat_title} does not match auto-order pattern.")
+        await update.message.reply_text(
+            "👋 Hello! I'm LoanBot.\n"
+            "⚠️ Auto-creation failed: Group name must start with 10 digits (YYMMDDNNNN).\n"
+            "Please use /create manually if needed."
+        )
+        return
+
+    # 2. 判断是否已存在订单
+    existing_order = db_operations.get_order_by_chat_id(chat_id)
+    if existing_order:
+        await update.message.reply_text(
+            "👋 Hello! Group recognized, but an order already exists here."
+        )
+        return
+
+    # 3. 判断新老客户 & 历史订单
+    # 规则: 2025年11月25之前的默认为老客户(B)，且资金不做变化
+    # 2025年11月25及之后的，由人工创建，机器人不自动创建
+    threshold_date = date(2025, 11, 25)
+    order_date = parsed_info['date']
+
+    if order_date >= threshold_date:
+        await update.message.reply_text(
+            "👋 Hello! I'm LoanBot.\n"
+            "ℹ️ New order detected (Date >= 2025-11-25).\n"
+            "Please create the order manually using /create command."
+        )
+        return
+
+    # 既然是历史订单，肯定是老客户
+    customer = 'B'  # 老客户
+    skip_financials = True
+
+    amount = parsed_info['amount']
+    order_id = parsed_info['order_id']
+    group_id = 'S01'  # 默认归属
+    # 入群当天的分组，还是订单日期的分组？通常是入群管理时的分组。保持 get_current_group()
+    weekday_group = get_current_group()
+
+    # 构造完整日期字符串 (YYYY-MM-DD HH:MM:SS)
+    # 简单起见，使用 order_date + " 12:00:00"
+    created_at = f"{order_date.strftime('%Y-%m-%d')} 12:00:00"
+
+    new_order = {
+        'order_id': order_id,
+        'group_id': group_id,
+        'chat_id': chat_id,
+        'date': created_at,
+        'group': weekday_group,
+        'customer': customer,
+        'amount': amount,
+        'state': 'normal'
+    }
+
+    # 4. 创建订单
+    if not db_operations.create_order(new_order):
+        await update.message.reply_text("❌ Auto-create failed: Order ID duplicate or DB error.")
+        return
+
+    # 5. 更新统计 (根据是否跳过)
+    if not skip_financials:
+        # 检查余额是否充足 (仅当非历史订单时检查?)
+        # 自动创建如果余额不足怎么办？
+        # 既然已经创建了订单，就必须扣款，否则数据不一致。
+        # 如果余额不足，这里会变成负数。
+
+        # 1. 有效订单统计
+        update_all_stats('valid', amount, 1, group_id)
+        # 2. 流动资金减少
+        update_liquid_capital(-amount)
+        # 3. 客户统计
+        client_field = 'new_clients' if customer == 'A' else 'old_clients'
+        update_all_stats(client_field, amount, 1, group_id)
+    else:
+        # 历史订单：
+        # 流动资金和现金余额不变 (不调用 update_liquid_capital)
+        # 有效订单数量和金额要增加
+        update_all_stats('valid', amount, 1, group_id)
+
+    # 6. 发送通知
+    msg = (
+        f"✅ Historical Order Imported\n\n"
+        f"📋 Order ID: {order_id}\n"
+        f"🏷️  Group ID: {group_id} (Default)\n"
+        f"📅 Date: {created_at}\n"
+        f"👤 Customer: Returning (Historical)\n"
+        f"💰 Amount: {amount:.2f}\n"
+        f"⚠️ Funds Update: Skipped (Historical Data Only)"
+    )
+    await update.message.reply_text(msg)
+
+
 async def handle_amount_operation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """处理金额操作（需要管理员权限）"""
     # 检查是否在群组中 (利息操作可能可以在私聊? 不，为了关联ID，最好也在群里，或者私聊不支持)
@@ -2122,6 +2280,10 @@ def main() -> None:
         "remove_employee", private_chat_only(admin_required(remove_employee))))
     application.add_handler(CommandHandler(
         "list_employees", private_chat_only(admin_required(list_employees))))
+
+    # 自动订单创建（新成员入群监听）
+    application.add_handler(MessageHandler(
+        filters.StatusUpdate.NEW_CHAT_MEMBERS, handle_new_chat_members))
 
     # 添加消息处理器（金额操作）- 需要管理员或员工权限
     # 只处理以 + 开头的消息（快捷操作）
