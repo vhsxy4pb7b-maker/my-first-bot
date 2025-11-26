@@ -1064,7 +1064,7 @@ async def set_breach(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def set_breach_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """违约订单完成 - 步骤1：请求金额"""
+    """违约订单完成 - 请求金额"""
     chat_id = update.message.chat_id
 
     order = db_operations.get_order_by_chat_id(chat_id)
@@ -1080,7 +1080,43 @@ async def set_breach_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(message)
         return
 
-    # 询问金额
+    # 检查是否直接提供了金额参数
+    if context.args and len(context.args) > 0:
+        try:
+            amount = float(context.args[0])
+            if amount <= 0:
+                await update.message.reply_text("❌ 金额必须大于0")
+                return
+
+            # 直接执行完成逻辑
+            db_operations.update_order_state(chat_id, 'breach_end')
+            group_id = order['group_id']
+
+            # 违约完成订单增加，金额增加
+            update_all_stats('breach_end', amount, 1, group_id)
+
+            # 更新流动资金 (Liquid Flow & Cash Balance)
+            update_liquid_capital(amount)
+
+            msg_en = f"✅ Breach Order Ended\nAmount: {amount:.2f}"
+            msg_cn = (
+                f"违约订单已完成！\n"
+                f"订单ID: {order['order_id']}\n"
+                f"完成金额: {amount:.2f}\n"
+                f"状态: breach_end"
+            )
+
+            if is_group_chat(update):
+                await update.message.reply_text(msg_en)
+            else:
+                await update.message.reply_text(msg_cn)
+            return
+
+        except ValueError:
+            await update.message.reply_text("❌ 金额格式错误，请输入有效的数字")
+            return
+
+    # 询问金额 (如果没有提供参数)
     if is_group_chat(update):
         await update.message.reply_text(
             "Please enter the final amount for this breach order (e.g., 5000).\n"
