@@ -2410,11 +2410,11 @@ def main() -> None:
 
     # 添加命令处理器（按新需求修改）
     application.add_handler(CommandHandler(
-        "start", private_chat_only(authorized_required(start))))
+        "start", private_chat_only(authorized_required(error_handler(start)))))
     application.add_handler(CommandHandler(
-        "report", private_chat_only(authorized_required(show_report))))
+        "report", private_chat_only(authorized_required(error_handler(show_report)))))
     application.add_handler(CommandHandler(
-        "search", private_chat_only(authorized_required(search_orders))))
+        "search", private_chat_only(authorized_required(error_handler(search_orders)))))
 
     # 订单操作命令（员工可用）
     application.add_handler(CommandHandler(

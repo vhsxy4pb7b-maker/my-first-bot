@@ -1,13 +1,11 @@
 import sqlite3
 import os
-from datetime import datetime
+import asyncio
 from typing import Optional, Dict, List, Tuple, Any
 from functools import wraps
 
 # 数据库文件路径 - 支持持久化存储
-# 如果设置了 DATA_DIR 环境变量，使用该目录；否则使用当前目录
 DATA_DIR = os.getenv('DATA_DIR', os.path.dirname(os.path.abspath(__file__)))
-# 确保目录存在
 os.makedirs(DATA_DIR, exist_ok=True)
 DB_NAME = os.path.join(DATA_DIR, 'loan_bot.db')
 
@@ -15,44 +13,52 @@ DB_NAME = os.path.join(DATA_DIR, 'loan_bot.db')
 def get_connection():
     """获取数据库连接"""
     conn = sqlite3.connect(DB_NAME, check_same_thread=False)
-    conn.row_factory = sqlite3.Row  # 使结果可以像字典一样访问
+    conn.row_factory = sqlite3.Row
     return conn
 
 
 def db_transaction(func):
-    """数据库事务装饰器: 自动处理连接开启、提交、回滚和关闭"""
+    """数据库事务装饰器: 异步执行，自动处理连接开启、提交、回滚和关闭"""
     @wraps(func)
-    def wrapper(*args, **kwargs):
-        conn = get_connection()
-        cursor = conn.cursor()
-        try:
-            # 将 cursor 注入到 kwargs 中，如果函数签名接受 'cursor'
-            # 或者直接作为第一个参数传递？
-            # 为了兼容现有代码，我们可能需要重构现有函数以接受 cursor
-            # 但那样改动太大。
-            # 另一种方式：装饰器管理 conn，将其传给函数，函数内部使用
-            return func(conn, cursor, *args, **kwargs)
-        except Exception as e:
-            conn.rollback()
-            print(f"Database error in {func.__name__}: {e}")
-            # 根据需要决定是否抛出异常或返回 False/None
-            # 现有代码多返回 False，我们保持这个行为
-            return False
-        finally:
-            conn.close()
+    async def wrapper(*args, **kwargs):
+        loop = asyncio.get_running_loop()
+
+        def sync_work():
+            conn = get_connection()
+            cursor = conn.cursor()
+            try:
+                # 执行被装饰的同步函数
+                result = func(conn, cursor, *args, **kwargs)
+                return result
+            except Exception as e:
+                conn.rollback()
+                print(f"Database error in {func.__name__}: {e}")
+                return False
+            finally:
+                conn.close()
+
+        return await loop.run_in_executor(None, sync_work)
     return wrapper
 
 
 def db_query(func):
-    """数据库查询装饰器: 自动处理连接开启和关闭"""
+    """数据库查询装饰器: 异步执行，自动处理连接开启和关闭"""
     @wraps(func)
-    def wrapper(*args, **kwargs):
-        conn = get_connection()
-        cursor = conn.cursor()
-        try:
-            return func(conn, cursor, *args, **kwargs)
-        finally:
-            conn.close()
+    async def wrapper(*args, **kwargs):
+        loop = asyncio.get_running_loop()
+
+        def sync_work():
+            conn = get_connection()
+            cursor = conn.cursor()
+            try:
+                return func(conn, cursor, *args, **kwargs)
+            except Exception as e:
+                print(f"Database query error in {func.__name__}: {e}")
+                raise e
+            finally:
+                conn.close()
+
+        return await loop.run_in_executor(None, sync_work)
     return wrapper
 
 # ========== 订单操作 ==========
@@ -188,12 +194,6 @@ def search_orders_all(conn, cursor) -> List[Dict]:
 def search_orders_advanced(conn, cursor, criteria: Dict) -> List[Dict]:
     """
     高级查找订单（支持混合条件）
-    criteria: 字典，包含可选键：
-        - group_id: str
-        - state: str
-        - customer: str
-        - order_id: str
-        - date_range: tuple(start_date, end_date)
     """
     query = "SELECT * FROM orders WHERE 1=1"
     params = []
@@ -387,7 +387,7 @@ def get_all_group_ids(conn, cursor) -> List[str]:
 
 @db_query
 def get_daily_data(conn, cursor, date: str, group_id: Optional[str] = None) -> Dict:
-    """获取日结数据（11:00-23:00为一个周期）"""
+    """获取日结数据"""
     if group_id:
         cursor.execute(
             'SELECT * FROM daily_data WHERE date = ? AND group_id = ?', (date, group_id))
@@ -471,13 +471,7 @@ def update_daily_data(conn, cursor, date: str, field: str, amount: float, group_
 
 @db_query
 def get_stats_by_date_range(conn, cursor, start_date: str, end_date: str, group_id: Optional[str] = None) -> Dict:
-    """
-    根据日期范围聚合统计数据
-    :param start_date: 开始日期 (YYYY-MM-DD)
-    :param end_date: 结束日期 (YYYY-MM-DD)
-    :param group_id: 可选，指定归属ID
-    :return: 聚合后的统计字典
-    """
+    """根据日期范围聚合统计数据"""
     # 构建查询条件
     where_clause = "date >= ? AND date <= ?"
     params = [start_date, end_date]
@@ -572,15 +566,15 @@ def record_expense(conn, cursor, date: str, type: str, amount: float, note: str)
     INSERT INTO expense_records (date, type, amount, note)
     VALUES (?, ?, ?, ?)
     ''', (date, type, amount, note))
-    
+
     # 2. 更新日结数据
     field = 'company_expenses' if type == 'company' else 'other_expenses'
-    
+
     # 复用 update_daily_data 逻辑的简化版
     cursor.execute(
         'SELECT * FROM daily_data WHERE date = ? AND group_id IS NULL', (date,))
     row = cursor.fetchone()
-    
+
     if not row:
         cursor.execute('''
         INSERT INTO daily_data (
@@ -600,12 +594,7 @@ def record_expense(conn, cursor, date: str, type: str, amount: float, note: str)
         ''', (amount, date))
 
     # 3. 更新全局流动资金 (扣除开销)
-    # 注意：update_financial_data 有装饰器 @db_transaction，
-    # 而 record_expense 也有 @db_transaction。
-    # SQLite 不支持嵌套事务，所以我们需要直接在这里执行 SQL，或者复用传入的 cursor。
-    
-    # update_financial_data 逻辑复制如下：
-    
+
     # 先获取当前值
     cursor.execute('SELECT * FROM financial_data ORDER BY id DESC LIMIT 1')
     row = cursor.fetchone()
@@ -621,7 +610,6 @@ def record_expense(conn, cursor, date: str, type: str, amount: float, note: str)
             breach_end_orders, breach_end_amount
         ) VALUES (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
         ''')
-        # conn.commit() # 不要在事务中 commit
         current_value = 0
     else:
         row_dict = dict(row)
@@ -629,14 +617,14 @@ def record_expense(conn, cursor, date: str, type: str, amount: float, note: str)
 
     # 更新值 (减少)
     new_value = current_value - amount
-    
+
     # 使用参数化查询防止SQL注入
     cursor.execute('''
     UPDATE financial_data 
     SET "liquid_funds" = ?, updated_at = CURRENT_TIMESTAMP
     WHERE id = (SELECT id FROM financial_data ORDER BY id DESC LIMIT 1)
     ''', (new_value,))
-    
+
     conn.commit()
     return True
 
@@ -646,7 +634,7 @@ def get_expense_records(conn, cursor, start_date: str, end_date: str = None, typ
     """获取开销记录（支持日期范围）"""
     query = "SELECT * FROM expense_records WHERE date >= ?"
     params = [start_date]
-    
+
     if end_date:
         query += " AND date <= ?"
         params.append(end_date)
@@ -654,13 +642,13 @@ def get_expense_records(conn, cursor, start_date: str, end_date: str = None, typ
         # 如果没有结束日期，就只查开始日期那一天
         query += " AND date <= ?"
         params.append(start_date)
-    
+
     if type:
         query += " AND type = ?"
         params.append(type)
-        
+
     query += " ORDER BY date DESC, created_at ASC"
-    
+
     cursor.execute(query, params)
     rows = cursor.fetchall()
     return [dict(row) for row in rows]
