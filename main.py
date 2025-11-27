@@ -1,4 +1,14 @@
 """Telegram订单管理机器人主入口"""
+import os
+import sys
+from pathlib import Path
+
+# 确保项目根目录在 Python 路径中
+# 这样无论从哪里运行，都能找到 config 模块
+project_root = Path(__file__).parent.absolute()
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
 import logging
 from telegram import error as telegram_error
 from telegram.ext import (
