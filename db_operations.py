@@ -131,6 +131,18 @@ def update_order_state(conn, cursor, chat_id: int, new_state: str) -> bool:
     return cursor.rowcount > 0
 
 
+@db_transaction
+def update_order_group_id(conn, cursor, chat_id: int, new_group_id: str) -> bool:
+    """更新订单归属ID"""
+    cursor.execute('''
+    UPDATE orders 
+    SET group_id = ?, updated_at = CURRENT_TIMESTAMP
+    WHERE chat_id = ?
+    ''', (new_group_id, chat_id))
+    conn.commit()
+    return cursor.rowcount > 0
+
+
 def delete_order_by_chat_id(chat_id: int) -> bool:
     """删除订单（标记为完成或违约完成时使用）"""
     return True
@@ -208,6 +220,48 @@ def search_orders_advanced(conn, cursor, criteria: Dict) -> List[Dict]:
     else:
         # 默认排除完成和违约完成的订单
         query += " AND state NOT IN ('end', 'breach_end')"
+
+    if 'customer' in criteria and criteria['customer']:
+        query += " AND customer = ?"
+        params.append(criteria['customer'])
+
+    if 'order_id' in criteria and criteria['order_id']:
+        query += " AND order_id = ?"
+        params.append(criteria['order_id'])
+
+    if 'date_range' in criteria and criteria['date_range']:
+        start_date, end_date = criteria['date_range']
+        query += " AND date >= ? AND date <= ?"
+        params.extend([start_date, end_date])
+
+    if 'weekday_group' in criteria and criteria['weekday_group']:
+        query += " AND weekday_group = ?"
+        params.append(criteria['weekday_group'])
+
+    query += " ORDER BY date DESC"
+
+    cursor.execute(query, params)
+    rows = cursor.fetchall()
+    return [dict(row) for row in rows]
+
+
+@db_query
+def search_orders_advanced_all_states(conn, cursor, criteria: Dict) -> List[Dict]:
+    """
+    高级查找订单（支持混合条件，包含所有状态的订单）
+    用于报表查找功能
+    """
+    query = "SELECT * FROM orders WHERE 1=1"
+    params = []
+
+    if 'group_id' in criteria and criteria['group_id']:
+        query += " AND group_id = ?"
+        params.append(criteria['group_id'])
+
+    if 'state' in criteria and criteria['state']:
+        query += " AND state = ?"
+        params.append(criteria['state'])
+    # 注意：这里不排除任何状态，包含所有状态的订单
 
     if 'customer' in criteria and criteria['customer']:
         query += " AND customer = ?"
@@ -557,6 +611,123 @@ def is_user_authorized(conn, cursor, user_id: int) -> bool:
         'SELECT 1 FROM authorized_users WHERE user_id = ?', (user_id,))
     return cursor.fetchone() is not None
 
+# ========== 支付账号操作 ==========
+
+
+@db_query
+def get_payment_account(conn, cursor, account_type: str) -> Optional[Dict]:
+    """获取支付账号信息"""
+    cursor.execute(
+        'SELECT * FROM payment_accounts WHERE account_type = ?', (account_type,))
+    row = cursor.fetchone()
+    if row:
+        return dict(row)
+    return None
+
+
+@db_query
+def get_all_payment_accounts(conn, cursor) -> List[Dict]:
+    """获取所有支付账号信息"""
+    cursor.execute('SELECT * FROM payment_accounts ORDER BY account_type, account_name')
+    rows = cursor.fetchall()
+    return [dict(row) for row in rows]
+
+
+@db_query
+def get_payment_accounts_by_type(conn, cursor, account_type: str) -> List[Dict]:
+    """获取指定类型的所有支付账号信息"""
+    cursor.execute(
+        'SELECT * FROM payment_accounts WHERE account_type = ? ORDER BY account_name', 
+        (account_type,))
+    rows = cursor.fetchall()
+    return [dict(row) for row in rows]
+
+
+@db_query
+def get_payment_account_by_id(conn, cursor, account_id: int) -> Optional[Dict]:
+    """根据ID获取支付账号信息"""
+    cursor.execute(
+        'SELECT * FROM payment_accounts WHERE id = ?', (account_id,))
+    row = cursor.fetchone()
+    if row:
+        return dict(row)
+    return None
+
+
+@db_transaction
+def create_payment_account(conn, cursor, account_type: str, account_number: str, 
+                          account_name: str = '', balance: float = 0) -> int:
+    """创建新的支付账号，返回账户ID"""
+    cursor.execute('''
+    INSERT INTO payment_accounts (account_type, account_number, account_name, balance)
+    VALUES (?, ?, ?, ?)
+    ''', (account_type, account_number, account_name or '', balance or 0))
+    conn.commit()
+    return cursor.lastrowid
+
+
+@db_transaction
+def update_payment_account_by_id(conn, cursor, account_id: int, account_number: str = None, 
+                                 account_name: str = None, balance: float = None) -> bool:
+    """根据ID更新支付账号信息"""
+    updates = []
+    params = []
+    
+    if account_number is not None:
+        updates.append('account_number = ?')
+        params.append(account_number)
+    
+    if account_name is not None:
+        updates.append('account_name = ?')
+        params.append(account_name)
+    
+    if balance is not None:
+        updates.append('balance = ?')
+        params.append(balance)
+    
+    if not updates:
+        return False
+    
+    updates.append('updated_at = CURRENT_TIMESTAMP')
+    params.append(account_id)
+    
+    set_clause = ", ".join(updates)
+    query = f'UPDATE payment_accounts SET {set_clause} WHERE id = ?'
+    cursor.execute(query, params)
+    conn.commit()
+    return True
+
+
+@db_transaction
+def delete_payment_account(conn, cursor, account_id: int) -> bool:
+    """删除支付账号"""
+    cursor.execute('DELETE FROM payment_accounts WHERE id = ?', (account_id,))
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+@db_transaction
+def update_payment_account(conn, cursor, account_type: str, account_number: str = None, 
+                          account_name: str = None, balance: float = None) -> bool:
+    """更新支付账号信息（兼容旧代码，更新该类型的第一个账户）"""
+    # 获取该类型的第一个账户
+    cursor.execute(
+        'SELECT * FROM payment_accounts WHERE account_type = ? LIMIT 1', (account_type,))
+    row = cursor.fetchone()
+    
+    if row:
+        # 更新现有记录
+        account_id = row['id']
+        return update_payment_account_by_id(conn, cursor, account_id, 
+                                           account_number, account_name, balance)
+    else:
+        # 创建新记录
+        if account_number:
+            create_payment_account(conn, cursor, account_type, account_number, 
+                                  account_name or '', balance or 0)
+            return True
+        return False
+
 
 @db_transaction
 def record_expense(conn, cursor, date: str, type: str, amount: float, note: str) -> bool:
@@ -652,3 +823,77 @@ def get_expense_records(conn, cursor, start_date: str, end_date: str = None, typ
     cursor.execute(query, params)
     rows = cursor.fetchall()
     return [dict(row) for row in rows]
+
+# ========== 定时播报操作 ==========
+
+
+@db_query
+def get_scheduled_broadcast(conn, cursor, slot: int) -> Optional[Dict]:
+    """获取指定槽位的定时播报"""
+    cursor.execute('SELECT * FROM scheduled_broadcasts WHERE slot = ?', (slot,))
+    row = cursor.fetchone()
+    return dict(row) if row else None
+
+
+@db_query
+def get_all_scheduled_broadcasts(conn, cursor) -> List[Dict]:
+    """获取所有定时播报"""
+    cursor.execute('SELECT * FROM scheduled_broadcasts ORDER BY slot')
+    rows = cursor.fetchall()
+    return [dict(row) for row in rows]
+
+
+@db_query
+def get_active_scheduled_broadcasts(conn, cursor) -> List[Dict]:
+    """获取所有激活的定时播报"""
+    cursor.execute('SELECT * FROM scheduled_broadcasts WHERE is_active = 1 ORDER BY slot')
+    rows = cursor.fetchall()
+    return [dict(row) for row in rows]
+
+
+@db_transaction
+def create_or_update_scheduled_broadcast(conn, cursor, slot: int, time: str, 
+                                       chat_id: Optional[int], chat_title: Optional[str], 
+                                       message: str, is_active: int = 1) -> bool:
+    """创建或更新定时播报"""
+    # 检查是否已存在
+    cursor.execute('SELECT * FROM scheduled_broadcasts WHERE slot = ?', (slot,))
+    row = cursor.fetchone()
+    
+    if row:
+        # 更新现有记录
+        cursor.execute('''
+        UPDATE scheduled_broadcasts 
+        SET time = ?, chat_id = ?, chat_title = ?, message = ?, 
+            is_active = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE slot = ?
+        ''', (time, chat_id, chat_title, message, is_active, slot))
+    else:
+        # 创建新记录
+        cursor.execute('''
+        INSERT INTO scheduled_broadcasts (slot, time, chat_id, chat_title, message, is_active)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ''', (slot, time, chat_id, chat_title, message, is_active))
+    
+    conn.commit()
+    return True
+
+
+@db_transaction
+def delete_scheduled_broadcast(conn, cursor, slot: int) -> bool:
+    """删除定时播报"""
+    cursor.execute('DELETE FROM scheduled_broadcasts WHERE slot = ?', (slot,))
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+@db_transaction
+def toggle_scheduled_broadcast(conn, cursor, slot: int, is_active: int) -> bool:
+    """切换定时播报的激活状态"""
+    cursor.execute('''
+    UPDATE scheduled_broadcasts 
+    SET is_active = ?, updated_at = CURRENT_TIMESTAMP
+    WHERE slot = ?
+    ''', (is_active, slot))
+    conn.commit()
+    return cursor.rowcount > 0

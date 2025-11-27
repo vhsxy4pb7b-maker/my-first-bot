@@ -93,23 +93,8 @@ def init_database():
         breach_amount REAL DEFAULT 0,
         breach_end_orders INTEGER DEFAULT 0,
         breach_end_amount REAL DEFAULT 0,
-        liquid_flow REAL DEFAULT 0,
-        company_expenses REAL DEFAULT 0,
-        other_expenses REAL DEFAULT 0,
         updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
         UNIQUE(date, group_id)
-    )
-    ''')
-
-    # 创建开销记录表
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS expense_records (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        date TEXT NOT NULL,
-        type TEXT NOT NULL,
-        amount REAL NOT NULL,
-        note TEXT,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
     )
     ''')
 
@@ -132,6 +117,78 @@ def init_database():
     CREATE TABLE IF NOT EXISTS authorized_users (
         user_id INTEGER PRIMARY KEY,
         added_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )
+    ''')
+
+    # 创建支付账号表（GCASH和PayMaya）
+    # 检查表是否存在，如果存在需要迁移（移除UNIQUE约束）
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='payment_accounts'")
+    table_exists = cursor.fetchone()
+    
+    if table_exists:
+        # 检查是否有UNIQUE约束（通过检查索引）
+        cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='payment_accounts'")
+        table_sql = cursor.fetchone()
+        if table_sql and 'UNIQUE' in table_sql[0]:
+            # 需要迁移：保存数据，重建表
+            cursor.execute('SELECT * FROM payment_accounts')
+            old_data = cursor.fetchall()
+            cursor.execute('DROP TABLE payment_accounts')
+            # 创建新表（无UNIQUE约束）
+            cursor.execute('''
+            CREATE TABLE payment_accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_type TEXT NOT NULL,
+                account_number TEXT NOT NULL,
+                account_name TEXT,
+                balance REAL DEFAULT 0,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            ''')
+            # 恢复数据
+            if old_data:
+                cursor.executemany('''
+                INSERT INTO payment_accounts (id, account_type, account_number, account_name, balance, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ''', old_data)
+    
+    # 创建表（如果不存在）
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS payment_accounts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        account_type TEXT NOT NULL,
+        account_number TEXT NOT NULL,
+        account_name TEXT,
+        balance REAL DEFAULT 0,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )
+    ''')
+
+    # 初始化支付账号（如果不存在）
+    cursor.execute('SELECT COUNT(*) FROM payment_accounts')
+    if cursor.fetchone()[0] == 0:
+        cursor.execute('''
+        INSERT INTO payment_accounts (account_type, account_number, account_name, balance)
+        VALUES ('gcash', '', '', 0)
+        ''')
+        cursor.execute('''
+        INSERT INTO payment_accounts (account_type, account_number, account_name, balance)
+        VALUES ('paymaya', '', '', 0)
+        ''')
+
+    # 创建定时播报表
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS scheduled_broadcasts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        slot INTEGER NOT NULL CHECK(slot >= 1 AND slot <= 3),
+        time TEXT NOT NULL,
+        chat_id INTEGER,
+        chat_title TEXT,
+        message TEXT NOT NULL,
+        is_active INTEGER DEFAULT 1,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(slot)
     )
     ''')
 
