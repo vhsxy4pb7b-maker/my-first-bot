@@ -6,8 +6,20 @@ from pathlib import Path
 # 确保项目根目录在 Python 路径中
 # 这样无论从哪里运行，都能找到 config 模块
 project_root = Path(__file__).parent.absolute()
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
+project_root_str = str(project_root)
+
+# 添加项目根目录到 Python 路径（如果还没有）
+if project_root_str not in sys.path:
+    sys.path.insert(0, project_root_str)
+
+# 调试信息（部署时可以看到）
+try:
+    print(f"[DEBUG] Project root: {project_root_str}")
+    print(f"[DEBUG] Current working directory: {os.getcwd()}")
+    print(f"[DEBUG] Python path includes project root: {project_root_str in sys.path}")
+    print(f"[DEBUG] Handlers directory exists: {Path(project_root / 'handlers' / '__init__.py').exists()}")
+except Exception as e:
+    print(f"[DEBUG] Error in debug output: {e}")
 
 import logging
 from telegram import error as telegram_error
